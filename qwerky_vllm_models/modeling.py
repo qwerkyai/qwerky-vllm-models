@@ -12,39 +12,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PyTorch MambaInLlama (Mamba) model for vLLM inference."""
+"""PyTorch MambaInLlama (Mamba) model for vLLM inference.
+
+This module uses vLLM's native Mamba ops - no mamba_ssm or causal_conv1d required.
+"""
 
 from dataclasses import dataclass, field
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, List
 
 import torch
 import torch.nn as nn
-from torch.nn import CrossEntropyLoss
-
-from transformers.modeling_utils import PreTrainedModel
-from transformers.utils import logging
-from transformers.modeling_outputs import CausalLMOutput
-
-from mamba_ssm.ops.triton.layer_norm import RMSNorm
-from mamba_ssm.modules.mha import MHA
-from mamba_ssm.utils.generation import decode as mamba_decode
-from transformers.activations import ACT2FN
-
-# Import Mamba dependencies
-import math
 import torch.nn.functional as F
+import math
+
 from einops import rearrange, repeat
-from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
 
-try:
-    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-except ImportError:
-    causal_conv1d_fn, causal_conv1d_update = None, None
-
-try:
-    from mamba_ssm.ops.triton.selective_state_update import selective_state_update
-except ImportError:
-    selective_state_update = None
+from transformers.utils import logging
 
 # Import config from our package
 from .configuration import MambaInLlamaMambaConfig
@@ -52,20 +35,42 @@ from .configuration import MambaInLlamaMambaConfig
 logger = logging.get_logger(__name__)
 
 # =============================================================================
-# vLLM DETECTION AND IMPORTS
+# vLLM NATIVE IMPORTS (replaces mamba_ssm)
 # =============================================================================
 
-VLLM_MODE = False
+# Try to import vLLM's native Mamba ops
+_vllm_available = False
+_selective_scan_fn = None
+_selective_state_update = None
+_causal_conv1d_fn = None
+_causal_conv1d_update = None
+_RMSNorm = None
 _vllm_LogitsProcessor = None
 _vllm_Sampler = None
-_vllm_ModelRegistry = None
 _vllm_MambaModelConfig = None
+_vllm_MambaStateShapeCalculator = None
+_vllm_MambaStateDtypeCalculator = None
+_vllm_Attention = None
+_vllm_RotaryEmbedding = None
 
 try:
+    # vLLM's native Mamba ops (Triton-accelerated)
+    from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
+        selective_scan_fn as _selective_scan_fn,
+        selective_state_update as _selective_state_update,
+    )
+    from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+        causal_conv1d_fn as _causal_conv1d_fn,
+        causal_conv1d_update as _causal_conv1d_update,
+    )
+
+    # vLLM's RMSNorm
+    from vllm.model_executor.layers.layernorm import RMSNorm as _RMSNorm
+
+    # vLLM model utilities
     from vllm.model_executor.layers.logits_processor import (
         LogitsProcessor as _vllm_LogitsProcessor,
     )
-    from vllm.model_executor.models import ModelRegistry as _vllm_ModelRegistry
 
     try:
         from vllm.model_executor.layers.sampler import Sampler as _vllm_Sampler
@@ -73,28 +78,182 @@ try:
         try:
             from vllm.v1.sample.sampler import Sampler as _vllm_Sampler
         except ImportError:
-            _vllm_Sampler = None
+            pass
 
-    # Import MambaModelConfig for proper prefix caching handling
+    # MambaModelConfig for proper prefix caching handling
     try:
         from vllm.model_executor.models.config import MambaModelConfig as _vllm_MambaModelConfig
     except ImportError:
-        _vllm_MambaModelConfig = None
+        pass
 
-    # Import Mamba state shape calculators
+    # Mamba state shape calculators
     try:
         from vllm.model_executor.layers.mamba.mamba_utils import (
             MambaStateShapeCalculator as _vllm_MambaStateShapeCalculator,
             MambaStateDtypeCalculator as _vllm_MambaStateDtypeCalculator,
         )
     except ImportError:
-        _vllm_MambaStateShapeCalculator = None
-        _vllm_MambaStateDtypeCalculator = None
+        pass
 
-    VLLM_MODE = True
-    logger.info("vLLM detected - dual-mode inference enabled")
-except ImportError:
-    pass
+    # vLLM's attention for hybrid model
+    try:
+        from vllm.model_executor.layers.attention import Attention as _vllm_Attention
+        from vllm.model_executor.layers.rotary_embedding import get_rope as _vllm_get_rope
+    except ImportError:
+        pass
+
+    _vllm_available = True
+    logger.info("vLLM native Mamba ops loaded successfully")
+
+except ImportError as e:
+    logger.warning(f"vLLM native Mamba ops not available: {e}")
+    logger.warning("Falling back to pure PyTorch implementation")
+
+
+# =============================================================================
+# PURE PYTORCH FALLBACKS (for non-vLLM environments)
+# =============================================================================
+
+class RMSNormFallback(nn.Module):
+    """RMSNorm fallback when vLLM is not available."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6, **kwargs):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+
+    def forward(self, x, residual=None):
+        if residual is not None:
+            x = x + residual
+            residual = x
+
+        input_dtype = x.dtype
+        x = x.to(torch.float32)
+        variance = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps)
+        x = self.weight * x.to(input_dtype)
+
+        if residual is not None:
+            return x, residual
+        return x
+
+
+# Use vLLM's RMSNorm if available, otherwise fallback
+RMSNorm = _RMSNorm if _RMSNorm is not None else RMSNormFallback
+
+
+def selective_scan_fn_fallback(
+    u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False, return_last_state=False
+):
+    """Pure PyTorch fallback for selective scan (slow but works)."""
+    batch, dim, seqlen = u.shape
+    dstate = A.shape[1]
+
+    if delta_softplus:
+        delta = F.softplus(delta + delta_bias.unsqueeze(0).unsqueeze(-1) if delta_bias is not None else delta)
+    elif delta_bias is not None:
+        delta = delta + delta_bias.unsqueeze(0).unsqueeze(-1)
+
+    # Discretize A
+    deltaA = torch.exp(delta.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(-1))  # (B, D, L, N)
+    deltaB_u = delta.unsqueeze(-1) * B.unsqueeze(2) * u.unsqueeze(-1)  # (B, D, L, N)
+
+    # Scan
+    x = torch.zeros(batch, dim, dstate, device=u.device, dtype=u.dtype)
+    ys = []
+    for i in range(seqlen):
+        x = deltaA[:, :, i] * x + deltaB_u[:, :, i]
+        y = torch.einsum("bdn,bdn->bd", x, C[:, :, :, i])
+        ys.append(y)
+    y = torch.stack(ys, dim=2)  # (B, D, L)
+
+    if D is not None:
+        y = y + D.unsqueeze(0).unsqueeze(-1) * u
+
+    if z is not None:
+        y = y * F.silu(z)
+
+    if return_last_state:
+        return y, x
+    return y
+
+
+def causal_conv1d_fn_fallback(x, weight, bias=None, activation=None):
+    """Pure PyTorch fallback for causal conv1d."""
+    # x: (batch, dim, seqlen)
+    # weight: (dim, kernel_size)
+    batch, dim, seqlen = x.shape
+    kernel_size = weight.shape[1]
+
+    # Pad for causal convolution
+    x_padded = F.pad(x, (kernel_size - 1, 0))
+
+    # Depthwise conv
+    weight_reshaped = weight.unsqueeze(1)  # (dim, 1, kernel_size)
+    out = F.conv1d(x_padded, weight_reshaped, bias=bias, groups=dim)
+
+    if activation in ["silu", "swish"]:
+        out = F.silu(out)
+
+    return out
+
+
+def causal_conv1d_update_fallback(x, conv_state, weight, bias=None, activation=None):
+    """Pure PyTorch fallback for causal conv1d state update."""
+    # x: (batch, dim)
+    # conv_state: (batch, dim, kernel_size)
+
+    # Shift state left and add new input
+    conv_state = torch.roll(conv_state, shifts=-1, dims=-1)
+    conv_state[:, :, -1] = x
+
+    # Compute output
+    out = torch.sum(conv_state * weight, dim=-1)
+    if bias is not None:
+        out = out + bias
+
+    if activation in ["silu", "swish"]:
+        out = F.silu(out)
+
+    return out
+
+
+def selective_state_update_fallback(
+    ssm_state, x, dt, A, B, C, D=None, z=None, dt_bias=None, dt_softplus=False
+):
+    """Pure PyTorch fallback for selective state update (decode step)."""
+    # ssm_state: (batch, nheads, dim, dstate)
+    # x: (batch, nheads, dim)
+
+    if dt_softplus:
+        dt = F.softplus(dt + dt_bias if dt_bias is not None else dt)
+    elif dt_bias is not None:
+        dt = dt + dt_bias
+
+    # A: (nheads, dim, dstate)
+    dA = torch.exp(dt.unsqueeze(-1) * A)  # (batch, nheads, dim, dstate)
+    dB = dt.unsqueeze(-1) * B.unsqueeze(2)  # (batch, nheads, dim, dstate)
+
+    # Update state
+    ssm_state.copy_(ssm_state * dA + x.unsqueeze(-1) * dB)
+
+    # Compute output
+    y = torch.einsum("bhdn,bhdn->bhd", ssm_state, C.unsqueeze(2))
+
+    if D is not None:
+        y = y + D * x
+
+    if z is not None:
+        y = y * F.silu(z)
+
+    return y
+
+
+# Use vLLM ops if available, otherwise fallbacks
+selective_scan_fn = _selective_scan_fn if _selective_scan_fn is not None else selective_scan_fn_fallback
+selective_state_update = _selective_state_update if _selective_state_update is not None else selective_state_update_fallback
+causal_conv1d_fn = _causal_conv1d_fn if _causal_conv1d_fn is not None else causal_conv1d_fn_fallback
+causal_conv1d_update = _causal_conv1d_update if _causal_conv1d_update is not None else causal_conv1d_update_fallback
 
 
 # =============================================================================
@@ -158,8 +317,12 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
+# =============================================================================
+# MAMBA LAYER (uses vLLM native ops)
+# =============================================================================
+
 class Mamba(nn.Module):
-    """Mamba SSM layer implementation."""
+    """Mamba SSM layer implementation using vLLM native ops."""
 
     def __init__(
         self,
@@ -273,7 +436,7 @@ class Mamba(nn.Module):
         )
 
     def forward(self, hidden_states, inference_params=None):
-        """Forward pass for Mamba layer."""
+        """Forward pass for Mamba layer using vLLM native ops."""
         batch, seqlen, dim = hidden_states.shape
 
         conv_state, ssm_state = None, None
@@ -320,16 +483,17 @@ class Mamba(nn.Module):
         need_state_update = conv_state is not None
         if need_state_update:
             conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))
-        if causal_conv1d_fn is None:
-            x = self.act(self.conv1d(x)[..., :seqlen])
-        else:
-            assert self.activation in ["silu", "swish"]
+
+        # Use vLLM's causal_conv1d_fn if available
+        if _causal_conv1d_fn is not None:
             x = causal_conv1d_fn(
                 x=x,
                 weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
                 bias=self.conv1d.bias,
                 activation=self.activation,
             )
+        else:
+            x = self.act(self.conv1d(x)[..., :seqlen])
 
         if not self.repeat_kv_before_conv:
             x = rearrange(
@@ -338,8 +502,9 @@ class Mamba(nn.Module):
             x = repeat_kv(x, self.repeat_group)
             x = rearrange(x, "b n_group l dstate -> b (n_group dstate) l")
 
-        assert self.activation in ["silu", "swish"]
         return_last_state = ssm_state is not None
+
+        # Use vLLM's selective_scan_fn
         y = selective_scan_fn(
             x,
             dt,
@@ -363,7 +528,7 @@ class Mamba(nn.Module):
         return out
 
     def step(self, hidden_states, conv_state, ssm_state):
-        """Single step for decoding."""
+        """Single step for decoding using vLLM native ops."""
         dtype = hidden_states.dtype
         assert hidden_states.shape[1] == 1, (
             "Only support decoding with 1 token at a time for now"
@@ -395,7 +560,16 @@ class Mamba(nn.Module):
             x = torch.repeat_interleave(x, dim=1, repeats=self.repeat_group)
             x = rearrange(x, "b n_group dstate -> b (n_group dstate)")
 
-        if causal_conv1d_update is None:
+        # Use vLLM's causal_conv1d_update if available
+        if _causal_conv1d_update is not None:
+            x = causal_conv1d_update(
+                x,
+                conv_state,
+                rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                self.conv1d.bias,
+                self.activation,
+            )
+        else:
             conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))
             conv_state[:, :, -1] = x
             x = torch.sum(
@@ -404,14 +578,6 @@ class Mamba(nn.Module):
             if self.conv1d.bias is not None:
                 x = x + self.conv1d.bias
             x = self.act(x).to(dtype=dtype)
-        else:
-            x = causal_conv1d_update(
-                x,
-                conv_state,
-                rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                self.conv1d.bias,
-                self.activation,
-            )
 
         if not self.repeat_kv_before_conv:
             x = rearrange(
@@ -427,7 +593,7 @@ class Mamba(nn.Module):
         z = rearrange(z, "b (h d) -> b h d", h=self.num_C_head)
         dt_bias = rearrange(self.dt_proj.bias, "(h d) -> h d", h=self.num_C_head)
 
-        assert selective_state_update is not None
+        # Use vLLM's selective_state_update
         y = selective_state_update(
             ssm_state, x, dt, A, B, C, D, z=z, dt_bias=dt_bias, dt_softplus=True
         )
@@ -504,6 +670,10 @@ class Mamba(nn.Module):
         return conv_state, ssm_state
 
 
+# =============================================================================
+# MLP LAYER
+# =============================================================================
+
 class MLP(nn.Module):
     """MLP layer."""
 
@@ -521,10 +691,64 @@ class MLP(nn.Module):
         self.down_proj = nn.Linear(
             self.intermediate_size, self.hidden_size, bias=False, **factory_kwargs
         )
-        self.act_fn = ACT2FN[hidden_act]
+        self.act_fn = nn.SiLU() if hidden_act == "silu" else nn.GELU()
 
     def forward(self, x):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+# =============================================================================
+# ATTENTION LAYER (uses vLLM native attention when available)
+# =============================================================================
+
+class RotaryEmbedding(nn.Module):
+    """Rotary position embedding fallback."""
+
+    def __init__(self, dim, max_position_embeddings=8192, base=10000.0, device=None):
+        super().__init__()
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, device=device).float() / self.dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        self._set_cos_sin_cache(max_position_embeddings, device)
+
+    def _set_cos_sin_cache(self, seq_len, device):
+        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+
+    def forward(self, x, seq_len=None):
+        if seq_len > self.max_position_embeddings:
+            self._set_cos_sin_cache(seq_len, x.device)
+        return (
+            self.cos_cached[:seq_len],
+            self.sin_cached[:seq_len],
+        )
+
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None):
+    """Apply rotary position embedding."""
+    if position_ids is not None:
+        cos = cos[position_ids].unsqueeze(1)
+        sin = sin[position_ids].unsqueeze(1)
+    else:
+        cos = cos.unsqueeze(0).unsqueeze(0)
+        sin = sin.unsqueeze(0).unsqueeze(0)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
 
 
 class MHADecoderLayer(nn.Module):
@@ -540,20 +764,26 @@ class MHADecoderLayer(nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         super(MHADecoderLayer, self).__init__()
         self.layer_idx = layer_idx
-        self.mha = MHA(
-            embed_dim=config.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_heads_kv=config.num_key_value_heads,
-            layer_idx=layer_idx,
-            mlp_dim=0,
-            qkv_proj_bias=False,
-            out_proj_bias=False,
-            rotary_emb_dim=config.hidden_size // config.num_attention_heads,
-            rotary_emb_base=config.rope_theta,
-            causal=True,
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads or config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_groups = self.num_heads // self.num_kv_heads
+
+        # QKV projection
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False, **factory_kwargs)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False, **factory_kwargs)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False, **factory_kwargs)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False, **factory_kwargs)
+
+        # Rotary embedding
+        self.rotary_emb = RotaryEmbedding(
+            self.head_dim,
+            max_position_embeddings=getattr(config, 'max_position_embeddings', 8192),
+            base=config.rope_theta,
             device=device,
-            dtype=dtype,
         )
+
         self.mlp = MLP(
             config.hidden_size,
             config.intermediate_size,
@@ -566,27 +796,114 @@ class MHADecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, **factory_kwargs
         )
-        self.residual_in_fp32 = True
+
+        # KV cache for inference
+        self.k_cache = None
+        self.v_cache = None
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
-        return self.mha.allocate_inference_cache(
-            batch_size, max_seqlen, dtype=dtype, **kwargs
+        device = self.q_proj.weight.device
+        cache_dtype = dtype or self.q_proj.weight.dtype
+        self.k_cache = torch.zeros(
+            batch_size, max_seqlen, self.num_kv_heads, self.head_dim,
+            device=device, dtype=cache_dtype
         )
+        self.v_cache = torch.zeros(
+            batch_size, max_seqlen, self.num_kv_heads, self.head_dim,
+            device=device, dtype=cache_dtype
+        )
+        return self.k_cache, self.v_cache
 
     def forward(
         self, hidden_states: torch.Tensor, inference_params=None, *args, **kwargs
     ):
+        batch_size, seq_len, _ = hidden_states.shape
+
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.mha(hidden_states, inference_params)
+
+        # Compute Q, K, V
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+
+        # Reshape for multi-head attention
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        # Apply rotary embedding
+        cos, sin = self.rotary_emb(q, seq_len)
+
+        # Handle position_ids for inference
+        if inference_params is not None and inference_params.seqlen_offset > 0:
+            position_ids = torch.arange(
+                inference_params.seqlen_offset,
+                inference_params.seqlen_offset + seq_len,
+                device=q.device
+            ).unsqueeze(0).expand(batch_size, -1)
+        else:
+            position_ids = torch.arange(seq_len, device=q.device).unsqueeze(0).expand(batch_size, -1)
+
+        q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+
+        # KV cache handling for inference
+        if inference_params is not None:
+            cache_key = f"attn_{self.layer_idx}"
+            if cache_key not in inference_params.key_value_memory_dict:
+                # Initialize cache
+                max_cache_len = inference_params.max_seqlen
+                inference_params.key_value_memory_dict[cache_key] = {
+                    'k': torch.zeros(batch_size, self.num_kv_heads, max_cache_len, self.head_dim, device=k.device, dtype=k.dtype),
+                    'v': torch.zeros(batch_size, self.num_kv_heads, max_cache_len, self.head_dim, device=v.device, dtype=v.dtype),
+                }
+
+            cache = inference_params.key_value_memory_dict[cache_key]
+            start_pos = inference_params.seqlen_offset
+            cache['k'][:, :, start_pos:start_pos+seq_len, :] = k.transpose(1, 2).transpose(2, 3).transpose(1, 2)
+            cache['v'][:, :, start_pos:start_pos+seq_len, :] = v.transpose(1, 2).transpose(2, 3).transpose(1, 2)
+
+            # Use cached K, V
+            k = cache['k'][:, :, :start_pos+seq_len, :]
+            v = cache['v'][:, :, :start_pos+seq_len, :]
+
+        # Repeat K, V for grouped query attention
+        if self.num_key_value_groups > 1:
+            k = k.repeat_interleave(self.num_key_value_groups, dim=1)
+            v = v.repeat_interleave(self.num_key_value_groups, dim=1)
+
+        # Scaled dot-product attention
+        scale = 1.0 / math.sqrt(self.head_dim)
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
+
+        # Causal mask
+        if seq_len > 1:
+            causal_mask = torch.triu(
+                torch.ones(seq_len, k.shape[-2], device=q.device, dtype=torch.bool),
+                diagonal=k.shape[-2] - seq_len + 1
+            )
+            attn_weights = attn_weights.masked_fill(causal_mask, float('-inf'))
+
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+        attn_output = torch.matmul(attn_weights, v)
+
+        # Reshape and project
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        hidden_states = self.o_proj(attn_output)
         hidden_states = residual + hidden_states
 
+        # MLP
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
+
         return hidden_states
 
+
+# =============================================================================
+# MAMBA DECODER LAYER
+# =============================================================================
 
 class MambaDecoderLayer(nn.Module):
     """Mamba SSM decoder layer."""
@@ -639,30 +956,15 @@ class MambaDecoderLayer(nn.Module):
         return hidden_states
 
 
-class MambaInLlamaMambaPreTrainedModel(PreTrainedModel):
-    """Base class for MambaInLlama models."""
+# =============================================================================
+# MODEL BACKBONE
+# =============================================================================
 
-    config_class = MambaInLlamaMambaConfig
-    base_model_prefix = "model"
-    supports_gradient_checkpointing = False
-    _no_split_modules = ["MambaDecoderLayer", "MHADecoderLayer"]
-    _supports_flash_attn_2 = True
-
-    def _init_weights(self, module):
-        """Initialize the weights."""
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-
-
-class MambaInLlamaMambaModel(MambaInLlamaMambaPreTrainedModel):
+class MambaInLlamaMambaModel(nn.Module):
     """The bare MambaInLlama Model transformer."""
 
     def __init__(self, config: MambaInLlamaMambaConfig, **kwargs):
-        super().__init__(config, **kwargs)
+        super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
@@ -677,7 +979,6 @@ class MambaInLlamaMambaModel(MambaInLlamaMambaPreTrainedModel):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_init()
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -733,383 +1034,6 @@ class MambaInLlamaMambaModel(MambaInLlamaMambaPreTrainedModel):
         }
 
 
-class MambaInLlamaMambaForCausalLM(MambaInLlamaMambaPreTrainedModel):
-    """MambaInLlama Model with language modeling head."""
-
-    _tied_weights_keys = ["lm_head.weight"]
-
-    @classmethod
-    def is_backend_compatible(cls) -> bool:
-        """Check if model is compatible with the current vLLM backend."""
-        return True
-
-    def __init__(
-        self,
-        config_or_vllm_config=None,
-        config: MambaInLlamaMambaConfig = None,
-        **kwargs,
-    ):
-        self._vllm_mode = False
-        actual_config = None
-
-        if config is not None:
-            actual_config = config
-        elif config_or_vllm_config is not None:
-            if hasattr(config_or_vllm_config, "model_config"):
-                self._vllm_mode = True
-                vllm_config = config_or_vllm_config
-                model_path = None
-                if hasattr(vllm_config.model_config, "model"):
-                    model_path = vllm_config.model_config.model
-                if model_path:
-                    actual_config = MambaInLlamaMambaConfig.from_pretrained(model_path)
-                elif hasattr(vllm_config.model_config, "hf_config"):
-                    hf_cfg = vllm_config.model_config.hf_config
-                    actual_config = MambaInLlamaMambaConfig(
-                        vocab_size=getattr(hf_cfg, "vocab_size", 32000),
-                        hidden_size=getattr(hf_cfg, "hidden_size", 4096),
-                        num_hidden_layers=getattr(hf_cfg, "num_hidden_layers", 32),
-                        num_attention_heads=getattr(hf_cfg, "num_attention_heads", 32),
-                        num_key_value_heads=getattr(hf_cfg, "num_key_value_heads", None),
-                        intermediate_size=getattr(hf_cfg, "intermediate_size", 11008),
-                        rms_norm_eps=getattr(hf_cfg, "rms_norm_eps", 1e-6),
-                        rope_theta=getattr(hf_cfg, "rope_theta", 10000.0),
-                        attn_layers=getattr(hf_cfg, "attn_layers", []),
-                        d_model=getattr(hf_cfg, "d_model", None),
-                        d_inner=getattr(hf_cfg, "d_inner", None),
-                        d_xb=getattr(hf_cfg, "d_xb", None),
-                        ssm_cfg=getattr(hf_cfg, "ssm_cfg", {}),
-                    )
-            elif isinstance(config_or_vllm_config, MambaInLlamaMambaConfig):
-                actual_config = config_or_vllm_config
-            else:
-                actual_config = config_or_vllm_config
-
-        if actual_config is None:
-            raise ValueError(
-                "Could not determine config. Provide either a MambaInLlamaMambaConfig "
-                "or vLLM config object."
-            )
-
-        super().__init__(actual_config, **kwargs)
-
-        self.model = MambaInLlamaMambaModel(actual_config, **kwargs)
-        self.vocab_size = actual_config.vocab_size
-        self.lm_head = nn.Linear(
-            actual_config.hidden_size, actual_config.vocab_size, bias=False
-        )
-
-        if actual_config.tie_word_embeddings:
-            self.lm_head.weight = self.model.embed_tokens.weight
-
-        self._cached_device = None
-
-        self._vllm_logits_processor = None
-        self._vllm_sampler = None
-        if VLLM_MODE and _vllm_LogitsProcessor is not None:
-            self._vllm_logits_processor = _vllm_LogitsProcessor(actual_config.vocab_size)
-        if VLLM_MODE and _vllm_Sampler is not None:
-            self._vllm_sampler = _vllm_Sampler()
-
-        self.post_init()
-
-    def get_input_embeddings(self):
-        return self.model.get_input_embeddings()
-
-    def set_input_embeddings(self, value):
-        self.model.set_input_embeddings(value)
-
-    def get_output_embeddings(self):
-        return self.lm_head
-
-    def set_output_embeddings(self, new_embeddings):
-        self.lm_head = new_embeddings
-
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Apply token embeddings to input_ids."""
-        return self.model.embed_tokens(input_ids)
-
-    def _is_vllm_context(
-        self, kv_caches=None, attn_metadata=None, kwargs=None
-    ) -> bool:
-        """Detect if we're being called by vLLM or HuggingFace."""
-        if kv_caches is not None or attn_metadata is not None:
-            return True
-        if kwargs:
-            return "kv_caches" in kwargs or "attn_metadata" in kwargs
-        return False
-
-    def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        positions: Optional[torch.LongTensor] = None,
-        kv_caches: Optional[list] = None,
-        attn_metadata=None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        inference_params=None,
-        num_last_tokens: int = 0,
-        intermediate_tensors=None,
-        **kwargs,
-    ) -> Union[Tuple, CausalLMOutput, torch.Tensor]:
-        """Unified forward pass supporting both HuggingFace and vLLM modes."""
-        if self._is_vllm_context(kv_caches, attn_metadata, kwargs):
-            return self._forward_vllm(
-                input_ids=input_ids,
-                positions=positions or position_ids,
-                inputs_embeds=inputs_embeds,
-                kv_caches=kv_caches or kwargs.get("kv_caches"),
-                attn_metadata=attn_metadata or kwargs.get("attn_metadata"),
-            )
-        else:
-            return self._forward_hf(
-                input_ids=input_ids,
-                inputs_embeds=inputs_embeds,
-                position_ids=position_ids if position_ids is not None else positions,
-                labels=labels,
-                inference_params=inference_params,
-                num_last_tokens=num_last_tokens,
-                **kwargs,
-            )
-
-    def _forward_hf(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        inference_params=None,
-        num_last_tokens: int = 0,
-        **kwargs,
-    ) -> CausalLMOutput:
-        """HuggingFace-style forward pass."""
-        is_prefill = (
-            labels is None
-            and (
-                inference_params is None
-                or getattr(inference_params, "seqlen_offset", 0) == 0
-            )
-            and num_last_tokens == 0
-        )
-
-        if is_prefill:
-            num_last_tokens = 1
-
-        hidden_states = self.model(
-            input_ids=input_ids,
-            inputs_embeds=inputs_embeds,
-            position_ids=position_ids,
-            inference_params=inference_params,
-            num_last_tokens=num_last_tokens,
-            **kwargs,
-        )
-
-        logits = self.lm_head(hidden_states)
-
-        loss = None
-        if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss_fct = CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_labels = shift_labels.view(-1)
-            shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
-
-        return CausalLMOutput(loss=loss, logits=logits)
-
-    def _forward_vllm(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        kv_caches: list = None,
-        attn_metadata=None,
-    ) -> torch.Tensor:
-        """vLLM-style forward pass."""
-        if input_ids is not None and input_ids.dim() == 1:
-            input_ids = input_ids.unsqueeze(0)
-        if inputs_embeds is not None and inputs_embeds.dim() == 2:
-            inputs_embeds = inputs_embeds.unsqueeze(0)
-
-        if input_ids is not None:
-            seq_len = input_ids.shape[1] if input_ids.dim() > 1 else input_ids.shape[0]
-        elif inputs_embeds is not None:
-            seq_len = (
-                inputs_embeds.shape[1]
-                if inputs_embeds.dim() > 2
-                else inputs_embeds.shape[0]
-            )
-        else:
-            seq_len = 1
-
-        inference_params = _get_vllm_inference_params(seq_len)
-
-        if seq_len > 1 and inference_params.seqlen_offset > 0:
-            _reset_vllm_inference_params()
-            inference_params = _get_vllm_inference_params(seq_len)
-
-        hidden_states = self.model(
-            input_ids=input_ids,
-            inputs_embeds=inputs_embeds,
-            position_ids=positions.unsqueeze(0)
-            if positions is not None and positions.dim() == 1
-            else positions,
-            inference_params=inference_params,
-        )
-
-        _update_vllm_inference_offset(seq_len)
-
-        if hidden_states.dim() == 3:
-            hidden_states = hidden_states.squeeze(0)
-
-        return hidden_states
-
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        """Compute logits for vLLM sampling."""
-        if hidden_states.dim() == 3:
-            hidden_states = hidden_states.squeeze(0)
-
-        if self._vllm_logits_processor is not None:
-            return self._vllm_logits_processor(self.lm_head, hidden_states)
-
-        return self.lm_head(hidden_states)
-
-    def sample(
-        self,
-        logits: torch.Tensor,
-        sampling_metadata,
-    ):
-        """Sample tokens from logits for vLLM."""
-        if self._vllm_sampler is not None:
-            return self._vllm_sampler(logits, sampling_metadata)
-        return None
-
-    def load_weights(self, weights):
-        """Load weights from checkpoint for vLLM."""
-        weights_list = list(weights) if not isinstance(weights, list) else weights
-
-        params_dict = dict(self.named_parameters())
-        loaded_count = 0
-
-        for name, loaded_weight in weights_list:
-            if name in params_dict:
-                param = params_dict[name]
-                if param.shape == loaded_weight.shape:
-                    param.data.copy_(loaded_weight)
-                    loaded_count += 1
-                    continue
-
-            candidates = [name]
-            if name.startswith("model."):
-                candidates.append(name[6:])
-            else:
-                candidates.append(f"model.{name}")
-
-            if ".mha." in name:
-                candidates.append(name.replace(".mha.", ".self_attn."))
-
-            for candidate in candidates:
-                if candidate in params_dict:
-                    param = params_dict[candidate]
-                    if param.shape == loaded_weight.shape:
-                        param.data.copy_(loaded_weight)
-                        loaded_count += 1
-                        break
-
-        logger.info(f"Loaded {loaded_count}/{len(params_dict)} parameters")
-
-    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
-        """Allocate inference cache for all layers."""
-        return self.model.allocate_inference_cache(
-            batch_size, max_seqlen, dtype=dtype, **kwargs
-        )
-
-    def generate(
-        self,
-        input_ids,
-        max_length=1024,
-        top_k=50,
-        top_p=1.0,
-        min_p=0.0,
-        temperature=1.0,
-        repetition_penalty=1.0,
-        return_dict_in_generate=False,
-        output_scores=False,
-        **kwargs,
-    ):
-        """Generate sequences using the model."""
-        if input_ids.dim() == 1:
-            input_ids = input_ids.unsqueeze(0)
-
-        if self._cached_device is None:
-            self._cached_device = next(self.parameters()).device
-        device = self._cached_device
-
-        if input_ids.device != device:
-            input_ids = input_ids.to(device)
-        if input_ids.dtype != torch.long:
-            input_ids = input_ids.long()
-
-        batch_size = input_ids.shape[0]
-
-        if kwargs is not None:
-            max_new_tokens = kwargs.pop("max_new_tokens", None)
-            if max_new_tokens is not None:
-                max_length = max_new_tokens + input_ids.shape[1]
-
-            do_sample = kwargs.pop("do_sample", True)
-            if not do_sample:
-                top_k, top_p, min_p = 1, 0.0, 0.0
-
-            cg = kwargs.pop("cg", True)
-
-            eos_token_id = kwargs.pop("eos_token_id", self.config.eos_token_id)
-            if eos_token_id is not None:
-                if isinstance(eos_token_id, (list, tuple)):
-                    eos_token_id = torch.tensor(
-                        eos_token_id, dtype=torch.long, device=device
-                    )
-                else:
-                    eos_token_id = torch.tensor(
-                        [eos_token_id], dtype=torch.long, device=device
-                    )
-
-            kwargs.pop("attention_mask", None)
-            kwargs.pop("pad_token_id", None)
-            repetition_penalty = kwargs.pop("repetition_penalty", repetition_penalty)
-
-            kwargs.pop("use_cache", None)
-            kwargs.pop("no_repeat_ngram_size", None)
-            kwargs.pop("length_penalty", None)
-            kwargs.pop("num_return_sequences", None)
-            kwargs.pop("num_beams", None)
-            kwargs.pop("low_memory", None)
-            kwargs.pop("stopping_criteria", None)
-
-        output = mamba_decode(
-            input_ids,
-            self,
-            max_length,
-            top_k=top_k,
-            top_p=top_p,
-            min_p=min_p,
-            temperature=temperature,
-            repetition_penalty=repetition_penalty,
-            output_scores=output_scores,
-            cg=cg,
-            eos_token_id=eos_token_id,
-            **kwargs,
-        )
-        if not output_scores:
-            output.scores = None
-        return output if return_dict_in_generate else output.sequences
-
-
 # =============================================================================
 # NATIVE vLLM MODEL CLASS
 # =============================================================================
@@ -1121,11 +1045,9 @@ if _vllm_MambaModelConfig is not None:
 
 
 class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
-    """Native vLLM-compatible model class (no PreTrainedModel inheritance).
+    """Native vLLM-compatible model class (no mamba_ssm dependency).
 
-    Inherits from MambaModelConfig (when available) to properly handle:
-    - CUDA graph mode optimization for Mamba layers
-    - Automatic prefix caching disabling (not yet supported for hybrid models)
+    Uses vLLM's native Mamba ops for maximum compatibility.
     """
 
     is_hybrid: bool = True  # We have both Mamba and Attention layers
@@ -1134,21 +1056,13 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
 
     @classmethod
     def get_mamba_state_shape_from_config(cls, vllm_config) -> tuple:
-        """Calculate shapes for Mamba's convolutional and state caches.
-
-        Returns:
-            Tuple containing:
-            - conv_state_shape: Shape for convolutional state cache
-            - temporal_state_shape: Shape for state space model cache
-        """
+        """Calculate shapes for Mamba's convolutional and state caches."""
         if _vllm_MambaStateShapeCalculator is None:
-            # Fallback if calculator not available
             return ((3, 4096), (4096, 16))
 
         hf_config = vllm_config.model_config.hf_config
         parallel_config = vllm_config.parallel_config
 
-        # Get Mamba parameters from config
         d_inner = getattr(hf_config, "d_inner", hf_config.hidden_size)
         ssm_cfg = getattr(hf_config, "ssm_cfg", {})
         d_state = ssm_cfg.get("d_state", 16)
@@ -1165,7 +1079,6 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
     def get_mamba_state_dtype_from_config(cls, vllm_config) -> tuple:
         """Get dtypes for Mamba state caches."""
         if _vllm_MambaStateDtypeCalculator is None:
-            # Fallback to model dtype
             return (torch.bfloat16, torch.bfloat16)
 
         return _vllm_MambaStateDtypeCalculator.mamba1_state_dtype(
@@ -1176,7 +1089,7 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
 
     @classmethod
     def is_backend_compatible(cls) -> bool:
-        """Required by vLLM 0.9.x for custom model classes."""
+        """Required by vLLM for custom model classes."""
         return True
 
     @classmethod
@@ -1186,7 +1099,7 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
 
     @classmethod
     def _from_config(cls, config, **kwargs):
-        """Create model from config (required for AutoModel.from_config)."""
+        """Create model from config."""
         return cls(config=config, **kwargs)
 
     def __init__(
@@ -1245,9 +1158,9 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
 
         self._vllm_logits_processor = None
         self._vllm_sampler = None
-        if VLLM_MODE and _vllm_LogitsProcessor is not None:
+        if _vllm_available and _vllm_LogitsProcessor is not None:
             self._vllm_logits_processor = _vllm_LogitsProcessor(config.vocab_size)
-        if VLLM_MODE and _vllm_Sampler is not None:
+        if _vllm_available and _vllm_Sampler is not None:
             self._vllm_sampler = _vllm_Sampler()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:

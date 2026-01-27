@@ -25,8 +25,7 @@ requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0.0",
     "transformers>=4.40.0",
-    "mamba-ssm>=2.0.0",
-    "causal-conv1d>=1.2.0",
+    "vllm>=0.14.0",
     "einops>=0.7.0",
 ]
 
