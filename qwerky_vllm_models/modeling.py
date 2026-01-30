@@ -1622,6 +1622,22 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
                     loaded_count += 1
                 continue
 
+            # Handle A_log -> A conversion for Mamba layers
+            # Checkpoint stores A_log, we need A = -exp(A_log) as per Mamba paper
+            if ".mamba.A_log" in name:
+                new_name = name.replace(".mamba.A_log", ".mamba.A")
+                if new_name in params_dict:
+                    param = params_dict[new_name]
+                    # A = -exp(A_log) as per Mamba paper
+                    converted = -torch.exp(loaded_weight)
+                    if param.shape == converted.shape:
+                        param.data.copy_(converted)
+                        loaded_count += 1
+                        continue
+                    else:
+                        skipped_weights.append(f"{name} -> {new_name} (shape mismatch: {converted.shape} vs {param.shape})")
+                        continue
+
             # Try direct match
             if name in params_dict:
                 param = params_dict[name]

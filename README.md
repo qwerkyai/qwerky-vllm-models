@@ -39,6 +39,12 @@ This package uses vLLM's plugin system (`vllm.general_plugins` entry point) to r
 
 ## Changelog
 
+### 0.2.37
+- **CRITICAL FIX**: Handle `A_log` -> `A` weight conversion for Mamba layers
+- Checkpoint stores `A_log` but model uses `A = -exp(A_log)` per Mamba paper
+- This was causing 22 Mamba layer weights to not load, resulting in gibberish output
+- Now all 343/343 parameters should load correctly
+
 ### 0.2.36
 - **MAJOR**: Use `get_forward_context()` to retrieve state in vLLM V1 mode
 - In V1, `attn_metadata` is a dict keyed by layer `prefix` - now indexed correctly
