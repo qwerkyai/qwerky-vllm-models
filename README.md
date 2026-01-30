@@ -39,6 +39,14 @@ This package uses vLLM's plugin system (`vllm.general_plugins` entry point) to r
 
 ## Changelog
 
+### 0.2.36
+- **MAJOR**: Use `get_forward_context()` to retrieve state in vLLM V1 mode
+- In V1, `attn_metadata` is a dict keyed by layer `prefix` - now indexed correctly
+- Retrieve `state_indices_tensor` and `query_start_loc` from layer-specific metadata
+- Get `conv_state`/`ssm_state` from `self.kv_cache[virtual_engine]`
+- Added V1-specific debug logging to diagnose state retrieval
+- This matches how vLLM's native MambaMixer retrieves state in V1 architecture
+
 ### 0.2.33
 - **FIX**: Early return during warmup (matches vLLM native MambaMixer)
 - When attn_metadata is None, skip SSM computation entirely

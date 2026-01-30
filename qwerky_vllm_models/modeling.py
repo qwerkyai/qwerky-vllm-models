@@ -427,12 +427,15 @@ def _create_mamba_mixer_class():
             ) -> torch.Tensor:
                 """Forward pass with state management.
 
-                State is obtained from (in priority order):
-                1. Arguments (conv_state, ssm_state) if provided
-                2. self.kv_cache (bound by vLLM via bind_kv_cache)
-                3. Internal caches (self._conv_state, self._ssm_state)
+                In vLLM V1 mode, state is retrieved via get_forward_context():
+                - attn_metadata is a dict keyed by layer prefix
+                - kv_cache is indexed by virtual_engine
+                - state_indices comes from layer-specific Mamba1AttentionMetadata
+
+                Fallback for non-V1 mode or direct calls uses internal caches.
                 """
                 state_indices = None
+                query_start_loc = None
                 device = hidden_states.device
                 dtype = hidden_states.dtype
 
@@ -442,15 +445,84 @@ def _create_mamba_mixer_class():
                 else:
                     batch_size = hidden_states.shape[0]
 
-                # Try to get state from arguments first
+                # =============================================================
+                # V1 MODE: Use get_forward_context() to retrieve state
+                # This is how vLLM's native MambaMixer works in V1
+                # =============================================================
+                if get_forward_context is not None:
+                    try:
+                        forward_context = get_forward_context()
+                        if forward_context is not None:
+                            fc_attn_metadata = forward_context.attn_metadata
+
+                            # Debug log (once per layer)
+                            if not hasattr(self, '_v1_debug_logged'):
+                                logger.warning(f"[DEBUG V1] prefix={self.prefix}, "
+                                               f"forward_context available, "
+                                               f"attn_metadata type={type(fc_attn_metadata).__name__ if fc_attn_metadata else None}, "
+                                               f"is_dict={isinstance(fc_attn_metadata, dict)}")
+                                self._v1_debug_logged = True
+
+                            # In V1, attn_metadata is a dict keyed by layer prefix
+                            if fc_attn_metadata is not None and isinstance(fc_attn_metadata, dict):
+                                if self.prefix in fc_attn_metadata:
+                                    layer_metadata = fc_attn_metadata[self.prefix]
+
+                                    # Get state indices and query_start_loc from layer metadata
+                                    state_indices = getattr(layer_metadata, 'state_indices_tensor', None)
+                                    query_start_loc = getattr(layer_metadata, 'query_start_loc', None)
+
+                                    if not hasattr(self, '_v1_meta_debug_logged'):
+                                        logger.warning(f"[DEBUG V1] layer_metadata type={type(layer_metadata).__name__}, "
+                                                       f"state_indices={state_indices is not None}, "
+                                                       f"query_start_loc={query_start_loc is not None}")
+                                        self._v1_meta_debug_logged = True
+
+                                    # Get kv_cache from self.kv_cache indexed by virtual_engine
+                                    virtual_engine = getattr(forward_context, 'virtual_engine', 0)
+                                    if hasattr(self, 'kv_cache') and self.kv_cache is not None:
+                                        # kv_cache may be tuple (conv_state, ssm_state) or indexed by virtual_engine
+                                        if isinstance(self.kv_cache, (list, tuple)):
+                                            if len(self.kv_cache) > virtual_engine and isinstance(self.kv_cache[virtual_engine], (list, tuple)):
+                                                # kv_cache[virtual_engine] = (conv_state, ssm_state)
+                                                kv = self.kv_cache[virtual_engine]
+                                                if len(kv) >= 2 and kv[0].numel() > 0:
+                                                    conv_state = kv[0]
+                                                    ssm_state = kv[1]
+                                            elif len(self.kv_cache) >= 2:
+                                                # Direct tuple (conv_state, ssm_state)
+                                                if self.kv_cache[0].numel() > 0:
+                                                    conv_state = self.kv_cache[0]
+                                                    ssm_state = self.kv_cache[1]
+
+                                        if not hasattr(self, '_v1_kv_debug_logged'):
+                                            logger.warning(f"[DEBUG V1] kv_cache type={type(self.kv_cache)}, "
+                                                           f"conv_state={conv_state.shape if conv_state is not None and hasattr(conv_state, 'shape') else None}, "
+                                                           f"ssm_state={ssm_state.shape if ssm_state is not None and hasattr(ssm_state, 'shape') else None}")
+                                            self._v1_kv_debug_logged = True
+                                else:
+                                    # Prefix not in dict - log available keys
+                                    if not hasattr(self, '_v1_prefix_debug_logged'):
+                                        logger.warning(f"[DEBUG V1] prefix '{self.prefix}' not in attn_metadata dict, "
+                                                       f"available keys (first 5): {list(fc_attn_metadata.keys())[:5]}")
+                                        self._v1_prefix_debug_logged = True
+
+                    except Exception as e:
+                        if not hasattr(self, '_v1_error_logged'):
+                            logger.warning(f"[DEBUG V1] get_forward_context() error: {e}")
+                            self._v1_error_logged = True
+
+                # =============================================================
+                # FALLBACK: Try legacy approaches if V1 didn't provide state
+                # =============================================================
                 if conv_state is None or ssm_state is None:
-                    # Try to get from kv_cache (bound by vLLM)
+                    # Try to get from kv_cache directly (may be bound by vLLM)
                     if hasattr(self, 'kv_cache') and self.kv_cache is not None:
-                        if len(self.kv_cache) >= 2:
+                        if isinstance(self.kv_cache, (list, tuple)) and len(self.kv_cache) >= 2:
                             kv0, kv1 = self.kv_cache[0], self.kv_cache[1]
-                            if kv0.numel() > 0 and conv_state is None:
+                            if hasattr(kv0, 'numel') and kv0.numel() > 0 and conv_state is None:
                                 conv_state = kv0
-                            if kv1.numel() > 0 and ssm_state is None:
+                            if hasattr(kv1, 'numel') and kv1.numel() > 0 and ssm_state is None:
                                 ssm_state = kv1
 
                 # Fall back to internal caches
@@ -461,13 +533,16 @@ def _create_mamba_mixer_class():
                     if ssm_state is None:
                         ssm_state = self._ssm_state
 
-                # Try to get state_indices from attn_metadata
-                if attn_metadata is not None:
-                    if hasattr(attn_metadata, 'state_indices_tensor'):
-                        state_indices = attn_metadata.state_indices_tensor
+                # Try to get state_indices from attn_metadata argument (legacy V0 path)
+                if state_indices is None and attn_metadata is not None:
+                    mamba_meta = getattr(attn_metadata, 'mamba_metadata', None)
+                    if mamba_meta is not None:
+                        state_indices = getattr(mamba_meta, 'state_indices_tensor', None)
+                    if state_indices is None:
+                        state_indices = getattr(attn_metadata, 'state_indices_tensor', None)
 
                 # Run the actual computation
-                return self._forward_impl(hidden_states, conv_state, ssm_state, state_indices, attn_metadata)
+                return self._forward_impl(hidden_states, conv_state, ssm_state, state_indices, query_start_loc, attn_metadata)
 
             def _forward_impl(
                 self,
@@ -475,6 +550,7 @@ def _create_mamba_mixer_class():
                 conv_state: Optional[torch.Tensor],
                 ssm_state: Optional[torch.Tensor],
                 state_indices: Optional[torch.Tensor],
+                query_start_loc: Optional[torch.Tensor],
                 attn_metadata,
             ) -> torch.Tensor:
                 """Actual forward implementation using vLLM native ops."""
@@ -519,9 +595,24 @@ def _create_mamba_mixer_class():
 
                 # Use vLLM native ops if available AND we have valid state indices
                 # During warmup/profiling, state_indices is None and vLLM ops don't support that
-                if _mamba_ops_available and conv_state is not None and ssm_state is not None and state_indices is not None:
+                use_vllm = _mamba_ops_available and conv_state is not None and ssm_state is not None and state_indices is not None
+
+                # DEBUG: Log which path we're taking (remove after debugging)
+                if not hasattr(self, '_debug_logged'):
+                    logger.warning(f"[DEBUG] _mamba_ops_available={_mamba_ops_available}, "
+                                   f"conv_state={conv_state is not None}, ssm_state={ssm_state is not None}, "
+                                   f"state_indices={state_indices is not None}, use_vllm={use_vllm}")
+                    if conv_state is not None:
+                        logger.warning(f"[DEBUG] conv_state.shape={conv_state.shape}")
+                    if ssm_state is not None:
+                        logger.warning(f"[DEBUG] ssm_state.shape={ssm_state.shape}")
+                    if state_indices is not None:
+                        logger.warning(f"[DEBUG] state_indices.shape={state_indices.shape}, values={state_indices[:10] if len(state_indices) > 0 else 'empty'}")
+                    self._debug_logged = True
+
+                if use_vllm:
                     return self._forward_with_vllm_ops(
-                        x, z, B, C, dt, conv_state, ssm_state, state_indices, attn_metadata
+                        x, z, B, C, dt, conv_state, ssm_state, state_indices, query_start_loc, attn_metadata
                     )
                 else:
                     # Fallback to pure PyTorch (used during warmup when state_indices is None)
@@ -537,6 +628,7 @@ def _create_mamba_mixer_class():
                 conv_state: torch.Tensor,
                 ssm_state: torch.Tensor,
                 state_indices: Optional[torch.Tensor],
+                query_start_loc: Optional[torch.Tensor],
                 attn_metadata=None,
             ) -> torch.Tensor:
                 """Forward using vLLM's native Triton ops."""
@@ -556,16 +648,16 @@ def _create_mamba_mixer_class():
                 # Get conv weight in correct format (d_inner, d_conv)
                 conv_weight = rearrange(self.conv1d.weight, "d 1 w -> d w")
 
-                # Construct query_start_loc for vLLM 0.14+ API
-                # Try to get from attn_metadata first
-                query_start_loc = None
-                if attn_metadata is not None:
-                    if hasattr(attn_metadata, 'query_start_loc'):
-                        query_start_loc = attn_metadata.query_start_loc
-                    elif hasattr(attn_metadata, 'seq_start_loc'):
-                        query_start_loc = attn_metadata.seq_start_loc
+                # Use provided query_start_loc, or construct from input shape
+                if query_start_loc is None:
+                    # Try to get from attn_metadata
+                    if attn_metadata is not None:
+                        if hasattr(attn_metadata, 'query_start_loc'):
+                            query_start_loc = attn_metadata.query_start_loc
+                        elif hasattr(attn_metadata, 'seq_start_loc'):
+                            query_start_loc = attn_metadata.seq_start_loc
 
-                # If not available, construct from input shape
+                # If still not available, construct from input shape
                 if query_start_loc is None:
                     if x.dim() == 2:
                         # (total_tokens, dim) - treat as single sequence
