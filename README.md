@@ -39,6 +39,12 @@ This package uses vLLM's plugin system (`vllm.general_plugins` entry point) to r
 
 ## Changelog
 
+### 0.2.33
+- **FIX**: Early return during warmup (matches vLLM native MambaMixer)
+- When attn_metadata is None, skip SSM computation entirely
+- Just do in_proj -> out_proj for shape/memory profiling
+- No performance impact on actual inference (only affects warmup)
+
 ### 0.2.32
 - **FIX**: Handle None state_indices during warmup/profiling
 - When state_indices is None, pass None for conv_state/ssm_state to kernels

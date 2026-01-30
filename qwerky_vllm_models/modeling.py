@@ -478,6 +478,16 @@ def _create_mamba_mixer_class():
                 attn_metadata,
             ) -> torch.Tensor:
                 """Actual forward implementation using vLLM native ops."""
+                # Early return for V1 profile/warmup runs (like vLLM's native MambaMixer)
+                # When attn_metadata is None, skip SSM computation entirely
+                if attn_metadata is None:
+                    # Just do a simple projection for shape/memory profiling
+                    # This matches vLLM's native approach: out_proj(in_proj(x)[...])
+                    projected = self.in_proj(hidden_states)
+                    # Take the z portion (first d_inner) and pass through out_proj
+                    z_dummy = projected[..., :self.d_inner]
+                    return self.out_proj(z_dummy)
+
                 batch_or_tokens = hidden_states.shape[0]
 
                 # Fused projection: [z, x, B, C, dt]
@@ -507,13 +517,14 @@ def _create_mamba_mixer_class():
                 C = rearrange(C, "... (g d) -> ... g d", d=self.d_state)
                 # C now: (..., num_heads, d_state)
 
-                # Use vLLM native ops if available
-                if _mamba_ops_available and conv_state is not None and ssm_state is not None:
+                # Use vLLM native ops if available AND we have valid state indices
+                # During warmup/profiling, state_indices is None and vLLM ops don't support that
+                if _mamba_ops_available and conv_state is not None and ssm_state is not None and state_indices is not None:
                     return self._forward_with_vllm_ops(
                         x, z, B, C, dt, conv_state, ssm_state, state_indices, attn_metadata
                     )
                 else:
-                    # Fallback to pure PyTorch
+                    # Fallback to pure PyTorch (used during warmup when state_indices is None)
                     return self._forward_pytorch(x, z, B, C, dt, conv_state, ssm_state, state_indices)
 
             def _forward_with_vllm_ops(
@@ -629,17 +640,12 @@ def _create_mamba_mixer_class():
                     else:
                         x_t = rearrange(x, "b t d -> d (b t)")  # Flatten batch
 
-                    # IMPORTANT: When state_indices is None (e.g., during warmup), we must NOT
-                    # pass conv_state/ssm_state to the kernels - they expect both indices and
-                    # state together. Pass None for state when indices are unavailable.
-                    prefill_conv_state = conv_state if state_indices is not None else None
-                    prefill_ssm_state = ssm_state if state_indices is not None else None
-
+                    # Note: We only reach here when state_indices is not None (checked in _forward_impl)
                     x_conv = causal_conv1d_fn(
                         x_t,
                         conv_weight,
                         self.conv1d.bias,
-                        prefill_conv_state,
+                        conv_state,
                         query_start_loc,
                         cache_indices=state_indices,
                         activation="silu",
@@ -669,7 +675,7 @@ def _create_mamba_mixer_class():
 
                     y = selective_scan_fn(
                         x_conv,
-                        prefill_ssm_state,
+                        ssm_state,
                         dt_t,
                         self.A,
                         B_t,
