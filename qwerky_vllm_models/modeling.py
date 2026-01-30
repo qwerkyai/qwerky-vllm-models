@@ -574,9 +574,9 @@ def _create_mamba_mixer_class():
                     dim=-1,
                 )
 
-                # Delta time projection (without bias - bias applied in SSM kernel)
-                dt = self.dt_proj.weight @ dt.transpose(-1, -2)
-                dt = dt.transpose(-1, -2)  # Back to (..., d_inner)
+                # Delta time projection WITH bias (model trained with double bias)
+                # First bias application here, second in SSM kernel softplus
+                dt = self.dt_proj(dt)  # Full Linear with bias: (tokens, d_inner)
 
                 # Expand x via repeat_interleave if needed
                 if self.repeat_kv_before_conv:

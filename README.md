@@ -39,6 +39,13 @@ This package uses vLLM's plugin system (`vllm.general_plugins` entry point) to r
 
 ## Changelog
 
+### 0.2.38
+- **CRITICAL FIX**: Restore double bias in dt_proj for vLLM ops path
+- Model was trained with bias applied twice: once in dt_proj, once in softplus
+- Changed `dt_proj.weight @ dt` to `dt_proj(dt)` to include first bias application
+- SSM kernel applies second bias via `delta_bias` parameter
+- This matches the fix in v0.2.24 but was missing in the vLLM ops code path
+
 ### 0.2.37
 - **CRITICAL FIX**: Handle `A_log` -> `A` weight conversion for Mamba layers
 - Checkpoint stores `A_log` but model uses `A = -exp(A_log)` per Mamba paper
