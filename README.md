@@ -39,6 +39,12 @@ This package uses vLLM's plugin system (`vllm.general_plugins` entry point) to r
 
 ## Changelog
 
+### 0.2.39
+- **DEBUG**: Added split statistics logging to diagnose gibberish output
+- Logs z/x/B/C/dt shapes and mean/std after in_proj split
+- Logs which forward path is taken (vLLM ops vs PyTorch fallback)
+- This will help identify if the in_proj split order is correct
+
 ### 0.2.38
 - **CRITICAL FIX**: Restore double bias in dt_proj for vLLM ops path
 - Model was trained with bias applied twice: once in dt_proj, once in softplus

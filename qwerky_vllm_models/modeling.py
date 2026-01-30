@@ -574,6 +574,16 @@ def _create_mamba_mixer_class():
                     dim=-1,
                 )
 
+                # Debug: log split statistics on first forward (helps verify split order)
+                if not hasattr(self, '_split_debug_logged'):
+                    logger.warning(f"[SPLIT DEBUG] Layer {self.layer_idx}: "
+                                   f"z.shape={z.shape}, mean={z.float().mean():.4f}, std={z.float().std():.4f} | "
+                                   f"x.shape={x.shape}, mean={x.float().mean():.4f}, std={x.float().std():.4f} | "
+                                   f"B.shape={B.shape}, mean={B.float().mean():.4f}, std={B.float().std():.4f} | "
+                                   f"C.shape={C.shape}, mean={C.float().mean():.4f}, std={C.float().std():.4f} | "
+                                   f"dt.shape={dt.shape}, mean={dt.float().mean():.4f}, std={dt.float().std():.4f}")
+                    self._split_debug_logged = True
+
                 # Delta time projection WITH bias (model trained with double bias)
                 # First bias application here, second in SSM kernel softplus
                 dt = self.dt_proj(dt)  # Full Linear with bias: (tokens, d_inner)
@@ -611,10 +621,16 @@ def _create_mamba_mixer_class():
                     self._debug_logged = True
 
                 if use_vllm:
+                    if not hasattr(self, '_path_debug_logged'):
+                        logger.warning(f"[PATH DEBUG] Layer {self.layer_idx}: Using vLLM ops path")
+                        self._path_debug_logged = True
                     return self._forward_with_vllm_ops(
                         x, z, B, C, dt, conv_state, ssm_state, state_indices, query_start_loc, attn_metadata
                     )
                 else:
+                    if not hasattr(self, '_path_debug_logged'):
+                        logger.warning(f"[PATH DEBUG] Layer {self.layer_idx}: Using PyTorch fallback path")
+                        self._path_debug_logged = True
                     # Fallback to pure PyTorch (used during warmup when state_indices is None)
                     return self._forward_pytorch(x, z, B, C, dt, conv_state, ssm_state, state_indices)
 
