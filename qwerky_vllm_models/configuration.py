@@ -118,10 +118,15 @@ class MambaInLlamaMambaConfig(PretrainedConfig):
         self.rope_scaling = rope_scaling
         self.attention_dropout = attention_dropout
 
-        # Mamba-specific parameters
+        # Mamba-specific parameters with sensible defaults
+        # IMPORTANT: MambaInLlama uses d_inner = hidden_size for Mamba layers
+        # (NOT intermediate_size, which is only for MLP layers)
         self.d_model = d_model if d_model is not None else hidden_size
-        self.d_inner = d_inner if d_inner is not None else intermediate_size
-        self.d_xb = d_xb
+        self.d_inner = d_inner if d_inner is not None else hidden_size
+        # d_xb default: num_key_value_heads * head_dim (GQA-style)
+        # For 8B: 8 * 128 = 1024, For 3B: 8 * 96 = 768
+        head_dim = hidden_size // num_attention_heads
+        self.d_xb = d_xb if d_xb is not None else (self.num_key_value_heads * head_dim)
         self.ssm_cfg = ssm_cfg if ssm_cfg is not None else {}
         self.attn_layers = attn_layers if attn_layers is not None else []
 

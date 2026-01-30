@@ -20,10 +20,10 @@ enabling serving without the --trust-remote-code flag.
 
 Usage:
     pip install qwerky-vllm-models
-    vllm serve QwerkyAI/Qwerky-Llama3.1-Mamba-8B-Llama3.3-70B-base-distill-sft
+    vllm serve QwerkyAI/Qwerky-Llama3.1-Mamba-8B-Llama3.3-70B-base-distill
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.32"
 
 # Track if we've already registered with Transformers
 _transformers_registered = False
@@ -76,6 +76,14 @@ def register():
 
     # Register using lazy loading (string path) to avoid CUDA issues
     # This defers the actual import until the model is needed
+
+    # Register models with vLLM's ModelRegistry using lazy loading (string path)
+    # to avoid CUDA re-initialization issues in worker subprocesses.
+    #
+    # vLLM determines task support ('generate' vs 'pooling') through:
+    # 1. Model architecture name suffix (e.g., "ForCausalLM" -> generate)
+    # 2. Model class inspection (is_text_generation_model, has_inner_state, etc.)
+    # 3. Protocol inheritance (HasInnerState, IsHybrid)
 
     if "MambaInLlamaMambaForCausalLM" not in registered:
         try:
