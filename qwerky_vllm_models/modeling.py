@@ -559,15 +559,9 @@ def _create_mamba_mixer_class():
                     print(f"[ENTRY DEBUG] MambaInLlamaMambaMixerVLLM.forward called! layer={self.layer_idx}, attn_metadata={attn_metadata is not None}", flush=True)
                     self._entry_debug = True
 
-                # Early return for V1 profile/warmup runs (like vLLM's native MambaMixer)
-                # When attn_metadata is None, skip SSM computation entirely
-                if attn_metadata is None:
-                    # Just do a simple projection for shape/memory profiling
-                    # This matches vLLM's native approach: out_proj(in_proj(x)[...])
-                    projected = self.in_proj(hidden_states)
-                    # Take the z portion (first d_inner) and pass through out_proj
-                    z_dummy = projected[..., :self.d_inner]
-                    return self.out_proj(z_dummy)
+                # NOTE: We removed the early return for attn_metadata=None here.
+                # The code below handles missing state gracefully via internal caches.
+                # Early return was causing gibberish because actual inference had attn_metadata=None.
 
                 batch_or_tokens = hidden_states.shape[0]
 

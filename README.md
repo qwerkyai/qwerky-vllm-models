@@ -39,6 +39,13 @@ This package uses vLLM's plugin system (`vllm.general_plugins` entry point) to r
 
 ## Changelog
 
+### 0.2.41
+- **CRITICAL FIX**: Remove early return when attn_metadata is None
+- The early return (added in v0.2.33) was triggering during actual inference, not just warmup
+- This caused the model to skip all SSM computation and output gibberish
+- Now the model always performs actual Mamba SSM computation
+- Internal caches are used when vLLM doesn't provide state
+
 ### 0.2.40
 - **DEBUG**: Added print statement at forward entry to confirm Mixer is called
 - Print shows layer index and whether attn_metadata is present
