@@ -39,6 +39,11 @@ This package uses vLLM's plugin system (`vllm.general_plugins` entry point) to r
 
 ## Changelog
 
+### 0.2.42
+- **FIX**: Fix shape mismatch in PyTorch fallback SSM computation
+- Line 843: `A.unsqueeze(0).unsqueeze(-1)` → `A.unsqueeze(0).unsqueeze(2)`
+- dt shape (batch, d_inner, seqlen) now correctly broadcasts with A shape (d_inner, d_state)
+
 ### 0.2.41
 - **CRITICAL FIX**: Remove early return when attn_metadata is None
 - The early return (added in v0.2.33) was triggering during actual inference, not just warmup

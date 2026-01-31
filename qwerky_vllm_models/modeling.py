@@ -839,8 +839,12 @@ def _create_mamba_mixer_class():
                 dt = F.softplus(dt + self.dt_proj.bias.unsqueeze(0).unsqueeze(-1))
 
                 # Simple SSM scan
+                # A shape: (d_inner, d_state), dt shape: (batch, d_inner, seqlen)
+                # We want dA = exp(dt * A) with result shape (batch, d_inner, seqlen, d_state)
                 A = self.A  # Already -exp(log(A))
-                dA = torch.exp(dt.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(-1))
+                # dt.unsqueeze(-1): (batch, d_inner, seqlen, 1)
+                # A.unsqueeze(0).unsqueeze(2): (1, d_inner, 1, d_state)
+                dA = torch.exp(dt.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(2))
 
                 # Reshape for scan
                 x_grouped = rearrange(x, "b (h d) l -> b h d l", h=self.num_heads)
