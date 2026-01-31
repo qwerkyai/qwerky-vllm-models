@@ -39,6 +39,11 @@ This package uses vLLM's plugin system (`vllm.general_plugins` entry point) to r
 
 ## Changelog
 
+### 0.2.40
+- **DEBUG**: Added print statement at forward entry to confirm Mixer is called
+- Print shows layer index and whether attn_metadata is present
+- This will reveal if forward is being called at all
+
 ### 0.2.39
 - **DEBUG**: Added split statistics logging to diagnose gibberish output
 - Logs z/x/B/C/dt shapes and mean/std after in_proj split

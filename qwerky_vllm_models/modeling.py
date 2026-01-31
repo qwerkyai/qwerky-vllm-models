@@ -554,6 +554,11 @@ def _create_mamba_mixer_class():
                 attn_metadata,
             ) -> torch.Tensor:
                 """Actual forward implementation using vLLM native ops."""
+                # DEBUG: Print at very start to confirm we're being called
+                if not hasattr(self, '_entry_debug'):
+                    print(f"[ENTRY DEBUG] MambaInLlamaMambaMixerVLLM.forward called! layer={self.layer_idx}, attn_metadata={attn_metadata is not None}", flush=True)
+                    self._entry_debug = True
+
                 # Early return for V1 profile/warmup runs (like vLLM's native MambaMixer)
                 # When attn_metadata is None, skip SSM computation entirely
                 if attn_metadata is None:
