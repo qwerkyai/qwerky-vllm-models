@@ -39,6 +39,12 @@ This package uses vLLM's plugin system (`vllm.general_plugins` entry point) to r
 
 ## Changelog
 
+### 0.2.43
+- **FIX**: Fix dtype mismatch in PyTorch fallback path
+- A and D parameters were initialized as float32, causing mismatch with bfloat16 inputs
+- Cast A and D to input dtype before use in SSM computation
+- Fixes: `RuntimeError: expected scalar type BFloat16 but found Float`
+
 ### 0.2.42
 - **FIX**: Fix shape mismatch in PyTorch fallback SSM computation
 - Line 843: `A.unsqueeze(0).unsqueeze(-1)` → `A.unsqueeze(0).unsqueeze(2)`

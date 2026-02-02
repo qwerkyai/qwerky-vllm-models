@@ -841,7 +841,8 @@ def _create_mamba_mixer_class():
                 # Simple SSM scan
                 # A shape: (d_inner, d_state), dt shape: (batch, d_inner, seqlen)
                 # We want dA = exp(dt * A) with result shape (batch, d_inner, seqlen, d_state)
-                A = self.A  # Already -exp(log(A))
+                # Cast A to same dtype as input to avoid float32/bfloat16 mismatch
+                A = self.A.to(x.dtype)  # Already -exp(log(A))
                 # dt.unsqueeze(-1): (batch, d_inner, seqlen, 1)
                 # A.unsqueeze(0).unsqueeze(2): (1, d_inner, 1, d_state)
                 dA = torch.exp(dt.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(2))
@@ -869,7 +870,8 @@ def _create_mamba_mixer_class():
                 y = rearrange(y, "b h d l -> b (h d) l")
 
                 # Skip connection and gate
-                y = y + self.D.unsqueeze(0).unsqueeze(-1) * x
+                # Cast D to input dtype to avoid float32/bfloat16 mismatch
+                y = y + self.D.to(x.dtype).unsqueeze(0).unsqueeze(-1) * x
                 y = y * F.silu(z)
 
                 y = rearrange(y, "b d l -> b l d")
@@ -983,7 +985,7 @@ def _create_mamba_mixer_class():
 
                 # Simplified SSM (no state caching in fallback)
                 y = x * F.silu(z)
-                y = y + self.D.unsqueeze(0).unsqueeze(-1) * x
+                y = y + self.D.to(x.dtype).unsqueeze(0).unsqueeze(-1) * x
 
                 y = rearrange(y, "b d l -> b l d")
                 return self.out_proj(y).squeeze(0)
