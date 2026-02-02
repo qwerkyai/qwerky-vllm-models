@@ -815,8 +815,7 @@ def _create_mamba_mixer_class():
                 ssm_state: Optional[torch.Tensor],
                 state_indices: Optional[torch.Tensor],
             ) -> torch.Tensor:
-                """Fallback PyTorch implementation."""
-                # Simple implementation for when vLLM ops not available
+                """Fallback PyTorch implementation with proper state handling."""
                 orig_shape = x.shape
                 if x.dim() == 2:
                     x = x.unsqueeze(0)
@@ -827,44 +826,72 @@ def _create_mamba_mixer_class():
 
                 batch, seqlen, _ = x.shape
 
-                # Transpose for conv
+                # Transpose for conv: (batch, seq, dim) -> (batch, dim, seq)
                 x = rearrange(x, "b l d -> b d l")
                 z = rearrange(z, "b l d -> b d l")
 
-                # Apply conv
-                x = F.silu(self.conv1d(x)[..., :seqlen])
+                # Handle conv_state for causal convolution
+                # conv_state stored as (batch, d_conv-1, conv_dim), transpose to (batch, conv_dim, d_conv-1)
+                if conv_state is not None and conv_state.numel() > 0:
+                    conv_state_t = conv_state.transpose(1, 2)  # (batch, conv_dim, d_conv-1)
+                    # Prepend conv_state to x for proper causal context
+                    x_with_state = torch.cat([conv_state_t, x], dim=-1)  # (batch, conv_dim, d_conv-1+seqlen)
+                    # Apply conv (no padding needed since we have the state)
+                    x_conv = self.conv1d.weight.squeeze(1)  # (conv_dim, d_conv)
+                    x_out = F.conv1d(x_with_state, x_conv.unsqueeze(1), self.conv1d.bias, groups=self.conv_dim)
+                    x = F.silu(x_out)  # (batch, conv_dim, seqlen)
+                    # Update conv_state with last d_conv-1 inputs
+                    # Take from x_with_state (which has the full history)
+                    new_conv_state = x_with_state[:, :, -(self.d_conv - 1):].transpose(1, 2)
+                    conv_state.copy_(new_conv_state)
+                else:
+                    # No state available, use regular conv with padding
+                    x = F.silu(self.conv1d(x)[..., :seqlen])
 
                 # Apply softplus to dt with bias (double bias as in original)
                 dt = rearrange(dt, "b l d -> b d l")
-                dt = F.softplus(dt + self.dt_proj.bias.unsqueeze(0).unsqueeze(-1))
+                dt = F.softplus(dt + self.dt_proj.bias.to(dt.dtype).unsqueeze(0).unsqueeze(-1))
 
-                # Simple SSM scan
-                # A shape: (d_inner, d_state), dt shape: (batch, d_inner, seqlen)
-                # We want dA = exp(dt * A) with result shape (batch, d_inner, seqlen, d_state)
+                # SSM scan setup
                 # Cast A to same dtype as input to avoid float32/bfloat16 mismatch
                 A = self.A.to(x.dtype)  # Already -exp(log(A))
-                # dt.unsqueeze(-1): (batch, d_inner, seqlen, 1)
-                # A.unsqueeze(0).unsqueeze(2): (1, d_inner, 1, d_state)
+                # dA = exp(dt * A) with shape (batch, d_inner, seqlen, d_state)
                 dA = torch.exp(dt.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(2))
 
-                # Reshape for scan
+                # Reshape for grouped scan
                 x_grouped = rearrange(x, "b (h d) l -> b h d l", h=self.num_heads)
-                dt_grouped = rearrange(dt, "b (h d) l -> b h d l", h=self.num_heads)
                 dA_grouped = rearrange(dA, "b (h d) l n -> b h d l n", h=self.num_heads)
                 B_t = rearrange(B, "b l h n -> b h n l")
                 C_t = rearrange(C, "b l h n -> b h n l")
 
                 head_dim = self.d_inner // self.num_heads
+                dt_grouped = rearrange(dt, "b (h d) l -> b h d l", h=self.num_heads)
                 dB_u = dt_grouped.unsqueeze(3) * B_t.unsqueeze(2) * x_grouped.unsqueeze(3)
 
-                # Sequential scan
-                state = torch.zeros(batch, self.num_heads, head_dim, self.d_state,
-                                   device=x.device, dtype=x.dtype)
+                # Initialize state from ssm_state if available
+                # ssm_state stored as (batch, d_state, d_inner), need (batch, num_heads, head_dim, d_state)
+                if ssm_state is not None and ssm_state.numel() > 0:
+                    # Transpose: (batch, d_state, d_inner) -> (batch, d_inner, d_state)
+                    ssm_state_t = ssm_state.transpose(1, 2)
+                    # Reshape: (batch, d_inner, d_state) -> (batch, num_heads, head_dim, d_state)
+                    state = rearrange(ssm_state_t, "b (h d) n -> b h d n", h=self.num_heads).to(x.dtype)
+                else:
+                    state = torch.zeros(batch, self.num_heads, head_dim, self.d_state,
+                                       device=x.device, dtype=x.dtype)
+
+                # Sequential SSM scan
                 outputs = []
                 for t in range(seqlen):
                     state = dA_grouped[:, :, :, t, :] * state + dB_u[:, :, :, :, t]
                     y_t = torch.einsum("bhdn,bhn->bhd", state, C_t[:, :, :, t])
                     outputs.append(y_t)
+
+                # Update ssm_state with final state
+                if ssm_state is not None and ssm_state.numel() > 0:
+                    # Reshape back: (batch, num_heads, head_dim, d_state) -> (batch, d_inner, d_state)
+                    final_state = rearrange(state, "b h d n -> b (h d) n")
+                    # Transpose back: (batch, d_inner, d_state) -> (batch, d_state, d_inner)
+                    ssm_state.copy_(final_state.transpose(1, 2))
 
                 y = torch.stack(outputs, dim=-1)
                 y = rearrange(y, "b h d l -> b (h d) l")

@@ -39,6 +39,14 @@ This package uses vLLM's plugin system (`vllm.general_plugins` entry point) to r
 
 ## Changelog
 
+### 0.2.44
+- **CRITICAL FIX**: Proper state persistence in PyTorch fallback path
+- Previously, SSM state was reset to zero every forward call, causing output degeneration
+- Now properly initializes SSM state from `ssm_state` parameter if provided
+- Updates `ssm_state` with final state after scan for next token generation
+- Handles `conv_state` for proper causal convolution context
+- This should fix the "Paris...garbage" issue where first token was correct but rest was gibberish
+
 ### 0.2.43
 - **FIX**: Fix dtype mismatch in PyTorch fallback path
 - A and D parameters were initialized as float32, causing mismatch with bfloat16 inputs
