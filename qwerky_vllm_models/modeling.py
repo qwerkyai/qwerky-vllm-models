@@ -221,27 +221,38 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 # =============================================================================
-# MAMBAINLLAMA MAMBA MIXER (Native vLLM ops with MambaBase integration)
+# MAMBAINLLAMA MAMBA MIXER (V1 State Management Integration)
 # =============================================================================
 
+# Try to import vLLM envs for V1 detection
+_vllm_envs = None
+try:
+    from vllm import envs as _vllm_envs
+except ImportError:
+    pass
+
+
 def _create_mamba_mixer_class():
-    """Factory function to create MambaInLlamaMambaMixer.
+    """Factory function to create MambaInLlamaMambaMixer with V1 state management.
 
-    Note: We intentionally do NOT inherit from MambaBase because:
-    1. MambaBase inherits from AttentionLayerBase which breaks nn.Module callability
-    2. MambaBase.__init__ doesn't properly initialize nn.Module parameters
-
-    Instead, we use a plain nn.Module with manual state management.
-    State is allocated by the model and passed to forward(), or managed internally.
+    This properly integrates with vLLM's V1 engine by:
+    1. Inheriting from CustomOp for proper forward dispatch
+    2. Registering in static_forward_context for V1 state binding
+    3. Using kv_cache for state storage (populated by vLLM)
+    4. Getting layer-specific metadata from attn_metadata dict
     """
 
-    # Always use plain nn.Module for proper callability and parameter registration
-    if True:  # Was: if _MambaBase is not None
-        class MambaInLlamaMambaMixerVLLM(nn.Module):
-            """MambaInLlama Mamba mixer using vLLM native ops.
+    # Determine base class - use CustomOp if available for proper V1 integration
+    if _CustomOp is not None:
+        # Use CustomOp for V1 integration with proper forward dispatch
+        @_CustomOp.register("mambainllama_mixer")
+        class MambaInLlamaMambaMixerVLLM(_CustomOp):
+            """MambaInLlama Mamba mixer with V1 state management.
 
-            Uses plain nn.Module for proper parameter registration and callability.
-            State is managed internally via self._conv_state and self._ssm_state.
+            Inherits from CustomOp to integrate with vLLM's V1 engine:
+            - Registers in static_forward_context for state binding
+            - Uses kv_cache for conv_state and ssm_state storage
+            - Gets layer-specific metadata from attn_metadata[prefix]
 
             Key architectural differences from standard Mamba:
             - Fused in_proj: outputs [z, x, B, C, dt] instead of separate projections
@@ -283,7 +294,7 @@ def _create_mamba_mixer_class():
                     bias=False,
                 )
 
-                # Conv1d - depthwise convolution (store weight in transposed form for vLLM ops)
+                # Conv1d - depthwise convolution
                 self.conv1d = nn.Conv1d(
                     in_channels=self.conv_dim,
                     out_channels=self.conv_dim,
@@ -324,24 +335,32 @@ def _create_mamba_mixer_class():
 
                 self.activation = "silu"
 
-                # Register in static_forward_context for vLLM state binding
-                if get_current_vllm_config is not None and prefix:
+                # =========================================================
+                # V1 STATE MANAGEMENT REGISTRATION
+                # This is the critical part that was missing!
+                # =========================================================
+                self._is_v1 = _vllm_envs is not None and getattr(_vllm_envs, 'VLLM_USE_V1', False)
+
+                if self._is_v1 and prefix:
                     try:
                         compilation_config = get_current_vllm_config().compilation_config
                         if prefix in compilation_config.static_forward_context:
                             raise ValueError(f"Duplicate layer name: {prefix}")
                         compilation_config.static_forward_context[prefix] = self
-                        logger.info(f"Registered MambaInLlamaMambaMixer {prefix} in static_forward_context")
+                        logger.info(f"[V1] Registered MambaInLlamaMambaMixer '{prefix}' in static_forward_context")
                     except Exception as e:
-                        logger.warning(f"Could not register in static_forward_context: {e}")
+                        logger.warning(f"[V1] Could not register in static_forward_context: {e}")
+                        self._is_v1 = False
 
-                # Internal state caches (allocated on first forward if not provided)
+                # kv_cache placeholder - V1 engine will bind real tensors here
+                # Structure: list of (conv_state, ssm_state) tuples, indexed by virtual_engine
+                # Using list for V0 PP compatibility, inner tuple for (conv, ssm) states
+                self.kv_cache = [(torch.tensor([]), torch.tensor([]))]
+
+                # Internal state caches (fallback for non-V1 mode)
                 self._conv_state: Optional[torch.Tensor] = None
                 self._ssm_state: Optional[torch.Tensor] = None
                 self._max_batch_size = 0
-
-                # Placeholder for vLLM-managed state (may be populated by bind_kv_cache)
-                self.kv_cache: tuple[torch.Tensor, ...] = (torch.tensor([]), torch.tensor([]))
 
             def allocate_inference_cache(
                 self,
@@ -413,26 +432,45 @@ def _create_mamba_mixer_class():
                 return "mamba1"
 
             # =================================================================
-            # Forward method (standard nn.Module interface)
+            # CustomOp forward methods (forward_native and forward_cuda)
+            # CustomOp.forward() dispatches to these based on platform
             # =================================================================
 
-            def forward(
+            def forward_native(
                 self,
                 hidden_states: torch.Tensor,
                 conv_state: Optional[torch.Tensor] = None,
                 ssm_state: Optional[torch.Tensor] = None,
-                cache_position: int = 0,
-                attn_metadata=None,
                 **kwargs,
             ) -> torch.Tensor:
-                """Forward pass with state management.
+                """PyTorch-native forward (used on CPU or when CUDA ops unavailable)."""
+                return self._forward_common(hidden_states, conv_state, ssm_state, use_cuda_ops=False, **kwargs)
 
-                In vLLM V1 mode, state is retrieved via get_forward_context():
-                - attn_metadata is a dict keyed by layer prefix
-                - kv_cache is indexed by virtual_engine
-                - state_indices comes from layer-specific Mamba1AttentionMetadata
+            def forward_cuda(
+                self,
+                hidden_states: torch.Tensor,
+                conv_state: Optional[torch.Tensor] = None,
+                ssm_state: Optional[torch.Tensor] = None,
+                **kwargs,
+            ) -> torch.Tensor:
+                """CUDA forward with V1 state management integration."""
+                return self._forward_common(hidden_states, conv_state, ssm_state, use_cuda_ops=True, **kwargs)
 
-                Fallback for non-V1 mode or direct calls uses internal caches.
+            def _forward_common(
+                self,
+                hidden_states: torch.Tensor,
+                conv_state: Optional[torch.Tensor] = None,
+                ssm_state: Optional[torch.Tensor] = None,
+                use_cuda_ops: bool = True,
+                **kwargs,
+            ) -> torch.Tensor:
+                """Common forward implementation with V1 state management.
+
+                This is the key integration point with vLLM V1:
+                1. Gets forward_context from vLLM
+                2. Retrieves attn_metadata[self.prefix] for this layer
+                3. Gets state from self.kv_cache (bound by vLLM)
+                4. Uses state_indices for proper batched state updates
                 """
                 state_indices = None
                 query_start_loc = None
@@ -440,132 +478,66 @@ def _create_mamba_mixer_class():
                 dtype = hidden_states.dtype
 
                 # Determine batch size
-                if hidden_states.dim() == 2:
-                    batch_size = 1
-                else:
-                    batch_size = hidden_states.shape[0]
+                batch_size = 1 if hidden_states.dim() == 2 else hidden_states.shape[0]
 
                 # =============================================================
-                # V1 MODE: Use get_forward_context() to retrieve state
-                # This is how vLLM's native MambaMixer works in V1
+                # V1 STATE RETRIEVAL (Critical for proper state management!)
                 # =============================================================
-                if get_forward_context is not None:
+                if self._is_v1 and get_forward_context is not None:
                     try:
                         forward_context = get_forward_context()
                         if forward_context is not None:
                             fc_attn_metadata = forward_context.attn_metadata
 
-                            # Debug log (once per layer)
-                            if not hasattr(self, '_v1_debug_logged'):
-                                logger.warning(f"[DEBUG V1] prefix={self.prefix}, "
-                                               f"forward_context available, "
-                                               f"attn_metadata type={type(fc_attn_metadata).__name__ if fc_attn_metadata else None}, "
-                                               f"is_dict={isinstance(fc_attn_metadata, dict)}")
-                                self._v1_debug_logged = True
+                            # V1 profile run - attn_metadata is None
+                            if fc_attn_metadata is None:
+                                if not hasattr(self, '_profile_logged'):
+                                    logger.info(f"[V1] Layer {self.layer_idx}: Profile run (attn_metadata=None)")
+                                    self._profile_logged = True
+                                # Return dummy output for profile run
+                                return self.out_proj(hidden_states[..., :self.d_inner])
 
-                            # In V1, attn_metadata is a dict keyed by layer prefix
-                            if fc_attn_metadata is not None and isinstance(fc_attn_metadata, dict):
+                            # V1 attn_metadata is a dict keyed by layer prefix
+                            if isinstance(fc_attn_metadata, dict):
                                 if self.prefix in fc_attn_metadata:
                                     layer_metadata = fc_attn_metadata[self.prefix]
-
-                                    # Get state indices and query_start_loc from layer metadata
                                     state_indices = getattr(layer_metadata, 'state_indices_tensor', None)
                                     query_start_loc = getattr(layer_metadata, 'query_start_loc', None)
 
-                                    if not hasattr(self, '_v1_meta_debug_logged'):
-                                        logger.warning(f"[DEBUG V1] layer_metadata type={type(layer_metadata).__name__}, "
-                                                       f"state_indices={state_indices is not None}, "
-                                                       f"query_start_loc={query_start_loc is not None}")
-                                        self._v1_meta_debug_logged = True
-
-                                    # Get kv_cache from self.kv_cache indexed by virtual_engine
+                                    # Get state from kv_cache (bound by vLLM)
                                     virtual_engine = getattr(forward_context, 'virtual_engine', 0)
-                                    if hasattr(self, 'kv_cache') and self.kv_cache is not None:
-                                        # kv_cache may be tuple (conv_state, ssm_state) or indexed by virtual_engine
-                                        if isinstance(self.kv_cache, (list, tuple)):
-                                            if len(self.kv_cache) > virtual_engine and isinstance(self.kv_cache[virtual_engine], (list, tuple)):
-                                                # kv_cache[virtual_engine] = (conv_state, ssm_state)
-                                                kv = self.kv_cache[virtual_engine]
-                                                if len(kv) >= 2 and kv[0].numel() > 0:
-                                                    conv_state = kv[0]
-                                                    ssm_state = kv[1]
-                                            elif len(self.kv_cache) >= 2:
-                                                # Direct tuple (conv_state, ssm_state)
-                                                if self.kv_cache[0].numel() > 0:
-                                                    conv_state = self.kv_cache[0]
-                                                    ssm_state = self.kv_cache[1]
+                                    if self.kv_cache and len(self.kv_cache) > virtual_engine:
+                                        kv = self.kv_cache[virtual_engine]
+                                        if isinstance(kv, (list, tuple)) and len(kv) >= 2:
+                                            if kv[0].numel() > 0:
+                                                conv_state = kv[0]
+                                                ssm_state = kv[1]
 
-                                        if not hasattr(self, '_v1_kv_debug_logged'):
-                                            logger.warning(f"[DEBUG V1] kv_cache type={type(self.kv_cache)}, "
-                                                           f"conv_state={conv_state.shape if conv_state is not None and hasattr(conv_state, 'shape') else None}, "
-                                                           f"ssm_state={ssm_state.shape if ssm_state is not None and hasattr(ssm_state, 'shape') else None}")
-                                            self._v1_kv_debug_logged = True
+                                    if not hasattr(self, '_v1_state_logged'):
+                                        logger.info(f"[V1] Layer {self.layer_idx}: Got state from kv_cache, "
+                                                   f"state_indices={'present' if state_indices is not None else 'None'}")
+                                        self._v1_state_logged = True
                                 else:
-                                    # Prefix not in dict - log available keys
-                                    if not hasattr(self, '_v1_prefix_debug_logged'):
-                                        logger.warning(f"[DEBUG V1] prefix '{self.prefix}' not in attn_metadata dict, "
-                                                       f"available keys (first 5): {list(fc_attn_metadata.keys())[:5]}")
-                                        self._v1_prefix_debug_logged = True
-
+                                    if not hasattr(self, '_v1_prefix_warn'):
+                                        logger.warning(f"[V1] prefix '{self.prefix}' not in attn_metadata. "
+                                                      f"Keys: {list(fc_attn_metadata.keys())[:5]}")
+                                        self._v1_prefix_warn = True
                     except Exception as e:
                         if not hasattr(self, '_v1_error_logged'):
-                            logger.warning(f"[DEBUG V1] get_forward_context() error: {e}")
+                            logger.warning(f"[V1] Error getting forward context: {e}")
                             self._v1_error_logged = True
 
                 # =============================================================
-                # FALLBACK: Try legacy approaches if V1 didn't provide state
+                # FALLBACK STATE (when V1 doesn't provide state)
                 # =============================================================
                 if conv_state is None or ssm_state is None:
-                    # Try to get from kv_cache directly (may be bound by vLLM)
-                    if hasattr(self, 'kv_cache') and self.kv_cache is not None:
-                        if isinstance(self.kv_cache, (list, tuple)) and len(self.kv_cache) >= 2:
-                            kv0, kv1 = self.kv_cache[0], self.kv_cache[1]
-                            if hasattr(kv0, 'numel') and kv0.numel() > 0 and conv_state is None:
-                                conv_state = kv0
-                            if hasattr(kv1, 'numel') and kv1.numel() > 0 and ssm_state is None:
-                                ssm_state = kv1
-
-                # Fall back to internal caches
-                if conv_state is None or ssm_state is None:
                     self._ensure_cache(batch_size, device, dtype)
-                    if conv_state is None:
-                        conv_state = self._conv_state
-                    if ssm_state is None:
-                        ssm_state = self._ssm_state
+                    conv_state = conv_state if conv_state is not None else self._conv_state
+                    ssm_state = ssm_state if ssm_state is not None else self._ssm_state
 
-                # Try to get state_indices from attn_metadata argument (legacy V0 path)
-                if state_indices is None and attn_metadata is not None:
-                    mamba_meta = getattr(attn_metadata, 'mamba_metadata', None)
-                    if mamba_meta is not None:
-                        state_indices = getattr(mamba_meta, 'state_indices_tensor', None)
-                    if state_indices is None:
-                        state_indices = getattr(attn_metadata, 'state_indices_tensor', None)
-
-                # Run the actual computation
-                return self._forward_impl(hidden_states, conv_state, ssm_state, state_indices, query_start_loc, attn_metadata)
-
-            def _forward_impl(
-                self,
-                hidden_states: torch.Tensor,
-                conv_state: Optional[torch.Tensor],
-                ssm_state: Optional[torch.Tensor],
-                state_indices: Optional[torch.Tensor],
-                query_start_loc: Optional[torch.Tensor],
-                attn_metadata,
-            ) -> torch.Tensor:
-                """Actual forward implementation using vLLM native ops."""
-                # DEBUG: Print at very start to confirm we're being called
-                if not hasattr(self, '_entry_debug'):
-                    print(f"[ENTRY DEBUG] MambaInLlamaMambaMixerVLLM.forward called! layer={self.layer_idx}, attn_metadata={attn_metadata is not None}", flush=True)
-                    self._entry_debug = True
-
-                # NOTE: We removed the early return for attn_metadata=None here.
-                # The code below handles missing state gracefully via internal caches.
-                # Early return was causing gibberish because actual inference had attn_metadata=None.
-
-                batch_or_tokens = hidden_states.shape[0]
-
-                # Fused projection: [z, x, B, C, dt]
+                # =============================================================
+                # PROJECTION AND EXPANSION
+                # =============================================================
                 zxbcdt = self.in_proj(hidden_states)
                 z, x, B, C, dt = torch.split(
                     zxbcdt,
@@ -573,19 +545,8 @@ def _create_mamba_mixer_class():
                     dim=-1,
                 )
 
-                # Debug: log split statistics on first forward (helps verify split order)
-                if not hasattr(self, '_split_debug_logged'):
-                    logger.warning(f"[SPLIT DEBUG] Layer {self.layer_idx}: "
-                                   f"z.shape={z.shape}, mean={z.float().mean():.4f}, std={z.float().std():.4f} | "
-                                   f"x.shape={x.shape}, mean={x.float().mean():.4f}, std={x.float().std():.4f} | "
-                                   f"B.shape={B.shape}, mean={B.float().mean():.4f}, std={B.float().std():.4f} | "
-                                   f"C.shape={C.shape}, mean={C.float().mean():.4f}, std={C.float().std():.4f} | "
-                                   f"dt.shape={dt.shape}, mean={dt.float().mean():.4f}, std={dt.float().std():.4f}")
-                    self._split_debug_logged = True
-
-                # Delta time projection WITH bias (model trained with double bias)
-                # First bias application here, second in SSM kernel softplus
-                dt = self.dt_proj(dt)  # Full Linear with bias: (tokens, d_inner)
+                # Delta time projection WITH bias (double bias as model was trained)
+                dt = self.dt_proj(dt)
 
                 # Expand x via repeat_interleave if needed
                 if self.repeat_kv_before_conv:
@@ -596,42 +557,29 @@ def _create_mamba_mixer_class():
                 # Expand B via repeat_interleave
                 B = rearrange(B, "... (g d) -> ... g d", d=self.d_state)
                 B = torch.repeat_interleave(B, self.repeat_group, dim=-2)
-                # B now: (..., num_heads, d_state)
 
                 # C is already d_inner, just reshape
                 C = rearrange(C, "... (g d) -> ... g d", d=self.d_state)
-                # C now: (..., num_heads, d_state)
 
-                # Use vLLM native ops if available AND we have valid state indices
-                # During warmup/profiling, state_indices is None and vLLM ops don't support that
-                use_vllm = _mamba_ops_available and conv_state is not None and ssm_state is not None and state_indices is not None
+                # =============================================================
+                # COMPUTATION PATH SELECTION
+                # =============================================================
+                # Use vLLM native ops only if: CUDA, ops available, state available, state_indices present
+                use_vllm = (use_cuda_ops and _mamba_ops_available and
+                           conv_state is not None and ssm_state is not None and
+                           state_indices is not None)
 
-                # DEBUG: Log which path we're taking (remove after debugging)
-                if not hasattr(self, '_debug_logged'):
-                    logger.warning(f"[DEBUG] _mamba_ops_available={_mamba_ops_available}, "
-                                   f"conv_state={conv_state is not None}, ssm_state={ssm_state is not None}, "
-                                   f"state_indices={state_indices is not None}, use_vllm={use_vllm}")
-                    if conv_state is not None:
-                        logger.warning(f"[DEBUG] conv_state.shape={conv_state.shape}")
-                    if ssm_state is not None:
-                        logger.warning(f"[DEBUG] ssm_state.shape={ssm_state.shape}")
-                    if state_indices is not None:
-                        logger.warning(f"[DEBUG] state_indices.shape={state_indices.shape}, values={state_indices[:10] if len(state_indices) > 0 else 'empty'}")
-                    self._debug_logged = True
+                if not hasattr(self, '_path_logged'):
+                    logger.info(f"[V1] Layer {self.layer_idx}: use_vllm={use_vllm}, "
+                               f"state_indices={'present' if state_indices is not None else 'None'}")
+                    self._path_logged = True
 
                 if use_vllm:
-                    if not hasattr(self, '_path_debug_logged'):
-                        logger.warning(f"[PATH DEBUG] Layer {self.layer_idx}: Using vLLM ops path")
-                        self._path_debug_logged = True
                     return self._forward_with_vllm_ops(
-                        x, z, B, C, dt, conv_state, ssm_state, state_indices, query_start_loc, attn_metadata
+                        x, z, B, C, dt, conv_state, ssm_state, state_indices, query_start_loc
                     )
                 else:
-                    if not hasattr(self, '_path_debug_logged'):
-                        logger.warning(f"[PATH DEBUG] Layer {self.layer_idx}: Using PyTorch fallback path")
-                        self._path_debug_logged = True
-                    # Fallback to pure PyTorch (used during warmup when state_indices is None)
-                    return self._forward_pytorch(x, z, B, C, dt, conv_state, ssm_state, state_indices)
+                    return self._forward_pytorch(x, z, B, C, dt, conv_state, ssm_state)
 
             def _forward_with_vllm_ops(
                 self,
@@ -642,20 +590,18 @@ def _create_mamba_mixer_class():
                 dt: torch.Tensor,
                 conv_state: torch.Tensor,
                 ssm_state: torch.Tensor,
-                state_indices: Optional[torch.Tensor],
+                state_indices: torch.Tensor,
                 query_start_loc: Optional[torch.Tensor],
-                attn_metadata=None,
             ) -> torch.Tensor:
-                """Forward using vLLM's native Triton ops."""
+                """Forward using vLLM's native Triton ops with V1 state management."""
                 # x: (tokens, d_inner), z: (tokens, d_inner)
                 # B, C: (tokens, num_heads, d_state), dt: (tokens, d_inner)
 
                 # Transpose states from storage format to computation format
                 # Storage: (batch, d_conv-1, conv_dim) -> Compute: (batch, conv_dim, d_conv-1)
                 # Storage: (batch, d_state, d_inner) -> Compute: (batch, d_inner, d_state)
-                # This gives stride_dim == 1 as required by causal_conv1d_fn
-                conv_state = conv_state.transpose(-1, -2)
-                ssm_state = ssm_state.transpose(-1, -2)
+                conv_state_t = conv_state.transpose(-1, -2).contiguous()
+                ssm_state_t = ssm_state.transpose(-1, -2).contiguous()
 
                 seqlen = x.shape[0] if x.dim() == 2 else x.shape[1]
                 is_decode = seqlen == 1
@@ -663,16 +609,7 @@ def _create_mamba_mixer_class():
                 # Get conv weight in correct format (d_inner, d_conv)
                 conv_weight = rearrange(self.conv1d.weight, "d 1 w -> d w")
 
-                # Use provided query_start_loc, or construct from input shape
-                if query_start_loc is None:
-                    # Try to get from attn_metadata
-                    if attn_metadata is not None:
-                        if hasattr(attn_metadata, 'query_start_loc'):
-                            query_start_loc = attn_metadata.query_start_loc
-                        elif hasattr(attn_metadata, 'seq_start_loc'):
-                            query_start_loc = attn_metadata.seq_start_loc
-
-                # If still not available, construct from input shape
+                # Construct query_start_loc if not provided
                 if query_start_loc is None:
                     if x.dim() == 2:
                         # (total_tokens, dim) - treat as single sequence
@@ -686,103 +623,76 @@ def _create_mamba_mixer_class():
                         query_start_loc = torch.arange(0, (batch_size + 1) * seq_len, seq_len,
                                                        dtype=torch.int32, device=x.device)
 
-                if is_decode and state_indices is not None:
+                if is_decode:
                     # Decode path - single token update
-                    # causal_conv1d_update expects: x (dim, batch), conv_state (slots, dim, width)
-                    x_t = x.squeeze(0) if x.dim() == 3 else x  # (batch, d_inner) or (d_inner,)
+                    x_t = x.squeeze(0) if x.dim() == 3 else x
                     if x_t.dim() == 1:
-                        x_t = x_t.unsqueeze(0)  # (1, d_inner)
+                        x_t = x_t.unsqueeze(0)
 
                     x_conv = causal_conv1d_update(
-                        x_t.transpose(0, 1),  # (d_inner, batch)
-                        conv_state,
+                        x_t.transpose(0, 1),
+                        conv_state_t,
                         conv_weight,
                         bias=self.conv1d.bias,
                         activation="silu",
                         conv_state_indices=state_indices,
                     )
-                    x_conv = x_conv.transpose(0, 1)  # (batch, d_inner)
+                    x_conv = x_conv.transpose(0, 1)
 
                     # SSM state update
-                    # selective_state_update expects specific shapes
-                    dt_squeezed = dt.squeeze(0) if dt.dim() == 3 else dt
-                    if dt_squeezed.dim() == 1:
-                        dt_squeezed = dt_squeezed.unsqueeze(0)
-
-                    B_squeezed = B.squeeze(0) if B.dim() == 3 else B
-                    if B_squeezed.dim() == 2:
-                        B_squeezed = B_squeezed.unsqueeze(0)
-
-                    C_squeezed = C.squeeze(0) if C.dim() == 3 else C
-                    if C_squeezed.dim() == 2:
-                        C_squeezed = C_squeezed.unsqueeze(0)
-
-                    z_squeezed = z.squeeze(0) if z.dim() == 3 else z
-                    if z_squeezed.dim() == 1:
-                        z_squeezed = z_squeezed.unsqueeze(0)
+                    dt_s = dt.squeeze(0) if dt.dim() == 3 else dt
+                    if dt_s.dim() == 1:
+                        dt_s = dt_s.unsqueeze(0)
+                    B_s = B.squeeze(0) if B.dim() == 3 else B
+                    if B_s.dim() == 2:
+                        B_s = B_s.unsqueeze(0)
+                    C_s = C.squeeze(0) if C.dim() == 3 else C
+                    if C_s.dim() == 2:
+                        C_s = C_s.unsqueeze(0)
+                    z_s = z.squeeze(0) if z.dim() == 3 else z
+                    if z_s.dim() == 1:
+                        z_s = z_s.unsqueeze(0)
 
                     y = selective_state_update(
-                        ssm_state,
+                        ssm_state_t,
                         x_conv,
-                        dt_squeezed,
+                        dt_s,
                         self.A,
-                        B_squeezed,
-                        C_squeezed,
+                        B_s,
+                        C_s,
                         D=self.D,
-                        z=z_squeezed,
+                        z=z_s,
                         dt_bias=self.dt_proj.bias,
                         dt_softplus=True,
                         state_batch_indices=state_indices,
-                        dst_state_batch_indices=state_indices,
                     )
                 else:
                     # Prefill path - full sequence
-                    # For prefill, use causal_conv1d_fn and selective_scan_fn
-                    # vLLM 0.14+ expects x as (dim, total_tokens) for varlen batching
-                    total_tokens = x.shape[0] if x.dim() == 2 else x.shape[0] * x.shape[1]
                     orig_shape = x.shape
-
                     if x.dim() == 2:
-                        x_t = x.transpose(0, 1)  # (tokens, dim) -> (dim, tokens)
+                        x_t = x.transpose(0, 1)
                     else:
-                        x_t = rearrange(x, "b t d -> d (b t)")  # Flatten batch
+                        x_t = rearrange(x, "b t d -> d (b t)")
 
-                    # Note: We only reach here when state_indices is not None (checked in _forward_impl)
                     x_conv = causal_conv1d_fn(
                         x_t,
                         conv_weight,
                         self.conv1d.bias,
-                        conv_state,
+                        conv_state_t,
                         query_start_loc,
                         cache_indices=state_indices,
                         activation="silu",
                     )
-                    # x_conv is (dim, total_tokens)
 
-                    # Prepare dt, B, C, z for selective_scan - need (dim, total_tokens) format
-                    if dt.dim() == 2:
-                        dt_t = dt.transpose(0, 1)  # (tokens, dim) -> (dim, tokens)
-                    else:
-                        dt_t = rearrange(dt, "b t d -> d (b t)")
-
-                    # B, C are (tokens, num_heads, d_state) - need to flatten
-                    if B.dim() == 3:
-                        B_t = rearrange(B, "t h d -> h d t")  # (num_heads, d_state, tokens)
-                    else:
-                        B_t = rearrange(B, "b t h d -> h d (b t)")
-                    if C.dim() == 3:
-                        C_t = rearrange(C, "t h d -> h d t")
-                    else:
-                        C_t = rearrange(C, "b t h d -> h d (b t)")
-
-                    if z.dim() == 2:
-                        z_t = z.transpose(0, 1)  # (tokens, dim) -> (dim, tokens)
-                    else:
-                        z_t = rearrange(z, "b t d -> d (b t)")
+                    # Prepare for selective_scan
+                    dt_t = dt.transpose(0, 1) if dt.dim() == 2 else rearrange(dt, "b t d -> d (b t)")
+                    B_t = rearrange(B, "t h d -> h d t") if B.dim() == 3 else rearrange(B, "b t h d -> h d (b t)")
+                    C_t = rearrange(C, "t h d -> h d t") if C.dim() == 3 else rearrange(C, "b t h d -> h d (b t)")
+                    z_t = z.transpose(0, 1) if z.dim() == 2 else rearrange(z, "b t d -> d (b t)")
 
                     y = selective_scan_fn(
                         x_conv,
-                        ssm_state,
+                        ssm_state_t,
                         dt_t,
                         self.A,
                         B_t,
@@ -794,11 +704,10 @@ def _create_mamba_mixer_class():
                         query_start_loc=query_start_loc,
                         cache_indices=state_indices,
                     )
-                    # y is (dim, total_tokens)
 
-                    # Reshape back to original format
+                    # Reshape back
                     if len(orig_shape) == 2:
-                        y = y.transpose(0, 1)  # (dim, tokens) -> (tokens, dim)
+                        y = y.transpose(0, 1)
                     else:
                         y = rearrange(y, "d (b t) -> b t d", b=orig_shape[0])
 
@@ -813,9 +722,8 @@ def _create_mamba_mixer_class():
                 dt: torch.Tensor,
                 conv_state: Optional[torch.Tensor],
                 ssm_state: Optional[torch.Tensor],
-                state_indices: Optional[torch.Tensor],
             ) -> torch.Tensor:
-                """Fallback PyTorch implementation with proper state handling."""
+                """Fallback PyTorch implementation for non-CUDA or profile runs."""
                 orig_shape = x.shape
                 if x.dim() == 2:
                     x = x.unsqueeze(0)
