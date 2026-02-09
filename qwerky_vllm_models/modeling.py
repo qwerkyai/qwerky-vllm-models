@@ -552,9 +552,17 @@ def _create_mamba_mixer_class():
                     dim=-1,
                 )
 
-                # Delta time projection WITHOUT bias (bias applied in softplus)
-                # This matches vLLM's skip_bias_add pattern
-                dt = F.linear(dt, self.dt_proj.weight)  # W @ dt only, no bias
+                # Debug: log split component stats (layer 0 only, first call)
+                if self.layer_idx == 0 and not hasattr(self, '_split_debug'):
+                    logger.info(f"[SPLIT DEBUG] z: mean={z.mean().item():.4f}, std={z.std().item():.4f}")
+                    logger.info(f"[SPLIT DEBUG] x: mean={x.mean().item():.4f}, std={x.std().item():.4f}")
+                    logger.info(f"[SPLIT DEBUG] B: mean={B.mean().item():.4f}, std={B.std().item():.4f}")
+                    logger.info(f"[SPLIT DEBUG] C: mean={C.mean().item():.4f}, std={C.std().item():.4f}")
+                    logger.info(f"[SPLIT DEBUG] dt: mean={dt.mean().item():.4f}, std={dt.std().item():.4f}")
+                    self._split_debug = True
+
+                # Delta time projection WITH bias (model trained with double bias)
+                dt = self.dt_proj(dt)  # W @ dt + bias
 
                 # Expand x via repeat_interleave if needed
                 if self.repeat_kv_before_conv:
@@ -764,8 +772,8 @@ def _create_mamba_mixer_class():
                     # No state available, use regular conv with padding
                     x = F.silu(self.conv1d(x)[..., :seqlen])
 
-                # Apply softplus to dt with single bias (matching vLLM skip_bias_add pattern)
-                # dt = W @ dt_raw (no bias from F.linear), now add bias and softplus
+                # Apply softplus to dt with double bias (model was trained this way)
+                # dt = W @ dt + bias (from dt_proj), now add bias again and softplus
                 dt = rearrange(dt, "b l d -> b d l")
                 dt = F.softplus(dt + self.dt_proj.bias.to(dt.dtype).unsqueeze(0).unsqueeze(-1))
 
