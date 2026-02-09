@@ -535,6 +535,13 @@ def _create_mamba_mixer_class():
                     conv_state = conv_state if conv_state is not None else self._conv_state
                     ssm_state = ssm_state if ssm_state is not None else self._ssm_state
 
+                    # Reset state on prefill (seqlen > 1) to avoid warmup contamination
+                    # Each new sequence should start fresh, not inherit from previous requests
+                    seqlen = hidden_states.shape[0] if hidden_states.dim() == 2 else hidden_states.shape[1]
+                    if seqlen > 1:
+                        conv_state.zero_()
+                        ssm_state.zero_()
+
                 # =============================================================
                 # PROJECTION AND EXPANSION
                 # =============================================================
