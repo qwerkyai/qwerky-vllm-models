@@ -787,12 +787,25 @@ def _create_mamba_mixer_class():
                     state = torch.zeros(batch, self.num_heads, head_dim, self.d_state,
                                        device=x.device, dtype=x.dtype)
 
+                # Debug: log state before scan (layer 0 only, first few calls)
+                if self.layer_idx == 0 and not hasattr(self, '_debug_count'):
+                    self._debug_count = 0
+                if self.layer_idx == 0 and self._debug_count < 5:
+                    logger.info(f"[DEBUG L0] seqlen={seqlen}, state_before_norm={state.norm().item():.4f}, "
+                               f"x_norm={x.norm().item():.4f}")
+
                 # Sequential SSM scan
                 outputs = []
                 for t in range(seqlen):
                     state = dA_grouped[:, :, :, t, :] * state + dB_u[:, :, :, :, t]
                     y_t = torch.einsum("bhdn,bhn->bhd", state, C_t[:, :, :, t])
                     outputs.append(y_t)
+
+                # Debug: log state after scan (layer 0 only)
+                if self.layer_idx == 0 and self._debug_count < 5:
+                    logger.info(f"[DEBUG L0] state_after_norm={state.norm().item():.4f}, "
+                               f"y_norm={torch.stack(outputs, dim=-1).norm().item():.4f}")
+                    self._debug_count += 1
 
                 # Update ssm_state with final state
                 if ssm_state is not None and ssm_state.numel() > 0:
