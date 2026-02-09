@@ -552,8 +552,9 @@ def _create_mamba_mixer_class():
                     dim=-1,
                 )
 
-                # Delta time projection WITH bias (double bias as model was trained)
-                dt = self.dt_proj(dt)
+                # Delta time projection WITHOUT bias (bias applied in softplus)
+                # This matches vLLM's skip_bias_add pattern
+                dt = F.linear(dt, self.dt_proj.weight)  # W @ dt only, no bias
 
                 # Expand x via repeat_interleave if needed
                 if self.repeat_kv_before_conv:
@@ -763,8 +764,8 @@ def _create_mamba_mixer_class():
                     # No state available, use regular conv with padding
                     x = F.silu(self.conv1d(x)[..., :seqlen])
 
-                # Apply softplus to dt with double bias (model was trained this way)
-                # dt already has bias from dt_proj, we add it again for double bias
+                # Apply softplus to dt with single bias (matching vLLM skip_bias_add pattern)
+                # dt = W @ dt_raw (no bias from F.linear), now add bias and softplus
                 dt = rearrange(dt, "b l d -> b d l")
                 dt = F.softplus(dt + self.dt_proj.bias.to(dt.dtype).unsqueeze(0).unsqueeze(-1))
 
