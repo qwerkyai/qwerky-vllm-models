@@ -763,15 +763,23 @@ def _create_mamba_mixer_class():
                     # No state available, use regular conv with padding
                     x = F.silu(self.conv1d(x)[..., :seqlen])
 
-                # Apply softplus to dt (bias already applied by dt_proj in _forward_common)
+                # Apply softplus to dt with double bias (model was trained this way)
+                # dt already has bias from dt_proj, we add it again for double bias
                 dt = rearrange(dt, "b l d -> b d l")
-                dt = F.softplus(dt)
+                dt = F.softplus(dt + self.dt_proj.bias.to(dt.dtype).unsqueeze(0).unsqueeze(-1))
 
                 # SSM scan setup
                 # Cast A to same dtype as input to avoid float32/bfloat16 mismatch
                 A = self.A.to(x.dtype)  # Already -exp(log(A))
                 # dA = exp(dt * A) with shape (batch, d_inner, seqlen, d_state)
                 dA = torch.exp(dt.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(2))
+
+                # Debug: log SSM parameters (layer 0 only, first call)
+                if self.layer_idx == 0 and not hasattr(self, '_ssm_debug'):
+                    logger.info(f"[SSM DEBUG] A: min={A.min().item():.4f}, max={A.max().item():.4f}, mean={A.mean().item():.4f}")
+                    logger.info(f"[SSM DEBUG] dt: min={dt.min().item():.4f}, max={dt.max().item():.4f}, mean={dt.mean().item():.4f}")
+                    logger.info(f"[SSM DEBUG] dA: min={dA.min().item():.4f}, max={dA.max().item():.4f}, mean={dA.mean().item():.4f}")
+                    self._ssm_debug = True
 
                 # Reshape for grouped scan
                 x_grouped = rearrange(x, "b (h d) l -> b h d l", h=self.num_heads)
