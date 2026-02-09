@@ -763,9 +763,9 @@ def _create_mamba_mixer_class():
                     # No state available, use regular conv with padding
                     x = F.silu(self.conv1d(x)[..., :seqlen])
 
-                # Apply softplus to dt with bias (double bias as in original)
+                # Apply softplus to dt (bias already applied by dt_proj in _forward_common)
                 dt = rearrange(dt, "b l d -> b d l")
-                dt = F.softplus(dt + self.dt_proj.bias.to(dt.dtype).unsqueeze(0).unsqueeze(-1))
+                dt = F.softplus(dt)
 
                 # SSM scan setup
                 # Cast A to same dtype as input to avoid float32/bfloat16 mismatch
