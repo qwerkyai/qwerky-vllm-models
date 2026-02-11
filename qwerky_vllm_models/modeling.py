@@ -997,7 +997,16 @@ class MLP(nn.Module):
 # =============================================================================
 
 class MHADecoderLayer(nn.Module):
-    """Multi-Head Attention decoder layer."""
+    """Multi-Head Attention decoder layer with self-managed KV cache.
+
+    This layer manages its own KV cache internally because vLLM's cache
+    system only allocates Mamba state caches for hybrid models — it does
+    not provide attention KV caches via the kv_caches parameter.
+
+    Without this self-managed cache, decode steps only see the current
+    single token (no history), producing garbage attention output that
+    poisons the residual stream for all downstream Mamba layers.
+    """
 
     def __init__(self, config: MambaInLlamaMambaConfig, layer_idx: int):
         super().__init__()
@@ -1007,19 +1016,43 @@ class MHADecoderLayer(nn.Module):
         self.num_kv_heads = config.num_key_value_heads or config.num_attention_heads
         self.head_dim = self.hidden_size // self.num_heads
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
+        self.max_position_embeddings = getattr(config, 'max_position_embeddings', 8192)
 
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
-        self.rotary_emb = None  # Will be initialized on first forward
+        self.rotary_emb = None
         self.rope_theta = config.rope_theta
-        self.max_position_embeddings = getattr(config, 'max_position_embeddings', 8192)
 
         self.mlp = MLP(config.hidden_size, config.intermediate_size, config.hidden_act)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # Self-managed KV cache — allocated lazily on first forward
+        self._k_cache: Optional[torch.Tensor] = None
+        self._v_cache: Optional[torch.Tensor] = None
+        self._max_batch_size = 0
+
+    def _ensure_kv_cache(self, batch_size: int, device: torch.device, dtype: torch.dtype):
+        """Lazily allocate KV cache on first use or when batch size grows."""
+        if (self._k_cache is None
+                or self._max_batch_size < batch_size
+                or self._k_cache.device != device):
+            self._k_cache = torch.zeros(
+                batch_size, self.num_kv_heads, self.max_position_embeddings, self.head_dim,
+                device=device, dtype=dtype,
+            )
+            self._v_cache = torch.zeros(
+                batch_size, self.num_kv_heads, self.max_position_embeddings, self.head_dim,
+                device=device, dtype=dtype,
+            )
+            self._max_batch_size = batch_size
+            if not hasattr(self, '_cache_alloc_logged'):
+                logger.info(f"[MHA L{self.layer_idx}] Allocated KV cache: "
+                           f"{list(self._k_cache.shape)}, dtype={dtype}")
+                self._cache_alloc_logged = True
 
     def _init_rope(self, device):
         """Initialize rotary embeddings."""
@@ -1033,17 +1066,14 @@ class MHADecoderLayer(nn.Module):
         """Apply rotary position embeddings."""
         self._init_rope(q.device)
 
-        # positions: (batch, seq_len)
         seq_len = positions.shape[-1] if positions.dim() > 1 else positions.shape[0]
         positions = positions.view(-1, seq_len)
 
-        # Compute freqs in float32 for precision, then cast to input dtype
         freqs = torch.outer(positions[0].float(), self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos().unsqueeze(0).unsqueeze(0).to(q.dtype)  # (1, 1, seq, head_dim)
+        cos = emb.cos().unsqueeze(0).unsqueeze(0).to(q.dtype)
         sin = emb.sin().unsqueeze(0).unsqueeze(0).to(q.dtype)
 
-        # Apply rotation
         def rotate_half(x):
             x1 = x[..., : x.shape[-1] // 2]
             x2 = x[..., x.shape[-1] // 2 :]
@@ -1060,15 +1090,17 @@ class MHADecoderLayer(nn.Module):
         kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         cache_position: int = 0,
     ) -> torch.Tensor:
-        # Handle both 2D [total_tokens, hidden] and 3D [batch, seq, hidden] input
         input_2d = hidden_states.dim() == 2
-        logger.info(f"MHA forward: input shape={hidden_states.shape}, input_2d={input_2d}")
         if input_2d:
-            hidden_states = hidden_states.unsqueeze(0)  # [1, total_tokens, hidden]
-            logger.info(f"MHA forward: after unsqueeze shape={hidden_states.shape}")
+            hidden_states = hidden_states.unsqueeze(0)
 
         batch_size, seq_len, _ = hidden_states.shape
-        logger.info(f"MHA forward: batch_size={batch_size}, seq_len={seq_len}")
+
+        # One-time shape logging
+        if not hasattr(self, '_forward_logged'):
+            logger.info(f"[MHA L{self.layer_idx}] First forward: batch={batch_size}, "
+                       f"seq_len={seq_len}, cache_pos={cache_position}")
+            self._forward_logged = True
 
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -1076,46 +1108,63 @@ class MHADecoderLayer(nn.Module):
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
-        logger.info(f"MHA forward: after proj q={q.shape}, k={k.shape}, v={v.shape}")
 
         q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        logger.info(f"MHA forward: after view/transpose q={q.shape}, k={k.shape}, v={v.shape}")
 
         q, k = self._apply_rotary_pos_emb(q, k, positions)
-        logger.info(f"MHA forward: after rotary q={q.shape}, k={k.shape}")
 
-        # KV cache handling
-        # k, v shape after transpose: [batch, num_kv_heads, seq_len, head_dim]
-        # k_cache, v_cache shape: [batch, num_kv_heads, max_seq_len, head_dim]
+        # =============================================================
+        # KV CACHE: use external if provided, otherwise self-manage
+        # =============================================================
         if kv_cache is not None:
+            # External cache from vLLM (future-proofing)
             k_cache, v_cache = kv_cache
             cache_seq_len = k_cache.shape[2]
-
-            # During warmup, seq_len may exceed cache size - skip caching in that case
             if cache_position + seq_len <= cache_seq_len:
-                k_cache[:, :, cache_position:cache_position+seq_len, :] = k
-                v_cache[:, :, cache_position:cache_position+seq_len, :] = v
-                k = k_cache[:, :, :cache_position+seq_len, :]
-                v = v_cache[:, :, :cache_position+seq_len, :]
+                k_cache[:, :, cache_position:cache_position + seq_len, :] = k
+                v_cache[:, :, cache_position:cache_position + seq_len, :] = v
+                k = k_cache[:, :, :cache_position + seq_len, :]
+                v = v_cache[:, :, :cache_position + seq_len, :]
+        else:
+            # Self-managed KV cache
+            self._ensure_kv_cache(batch_size, k.device, k.dtype)
+
+            # Reset cache on new sequence (prefill at position 0)
+            if cache_position == 0 and seq_len > 1:
+                self._k_cache.zero_()
+                self._v_cache.zero_()
+
+            end_pos = cache_position + seq_len
+            if end_pos <= self.max_position_embeddings:
+                self._k_cache[:batch_size, :, cache_position:end_pos, :] = k
+                self._v_cache[:batch_size, :, cache_position:end_pos, :] = v
+                k = self._k_cache[:batch_size, :, :end_pos, :]
+                v = self._v_cache[:batch_size, :, :end_pos, :]
             else:
-                # Warmup/dummy run with more tokens than cache can hold - skip caching
-                logger.warning(f"seq_len ({seq_len}) + cache_position ({cache_position}) exceeds cache size ({cache_seq_len}), skipping KV cache")
+                if not hasattr(self, '_overflow_warned'):
+                    logger.warning(f"[MHA L{self.layer_idx}] cache_position ({cache_position}) + "
+                                  f"seq_len ({seq_len}) exceeds max ({self.max_position_embeddings}), "
+                                  f"skipping cache")
+                    self._overflow_warned = True
 
         # GQA expansion
         if self.num_key_value_groups > 1:
             k = k.repeat_interleave(self.num_key_value_groups, dim=1)
             v = v.repeat_interleave(self.num_key_value_groups, dim=1)
 
-        # Attention
+        # Scaled dot-product attention
         scale = 1.0 / math.sqrt(self.head_dim)
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
 
+        # Causal mask only needed during prefill (seq_len > 1)
+        # During decode (seq_len=1), single query attends to all cached keys — no mask needed
         if seq_len > 1:
+            total_k_len = k.shape[-2]
             causal_mask = torch.triu(
-                torch.ones(seq_len, k.shape[-2], device=q.device, dtype=torch.bool),
-                diagonal=k.shape[-2] - seq_len + 1
+                torch.ones(seq_len, total_k_len, device=q.device, dtype=torch.bool),
+                diagonal=total_k_len - seq_len + 1,
             )
             attn_weights = attn_weights.masked_fill(causal_mask, float('-inf'))
 
@@ -1131,7 +1180,6 @@ class MHADecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        # Remove batch dim if we added it
         if input_2d:
             hidden_states = hidden_states.squeeze(0)
 
