@@ -87,8 +87,7 @@ try:
         ParallelLMHead,
     )
     from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-    from vllm.attention import Attention, AttentionMetadata
-    from vllm.attention.backends.abstract import AttentionType
+    from vllm.attention.layer import Attention
     from vllm.model_executor.layers.rotary_embedding import get_rope
     from vllm.distributed import get_tensor_model_parallel_world_size
     from vllm.config import VllmConfig, CacheConfig, get_current_vllm_config
@@ -543,6 +542,23 @@ def _create_mamba_mixer_class():
                         ssm_state.zero_()
 
                 # =============================================================
+                # CONV STATE DEBUG (D-1 investigation)
+                # =============================================================
+                if self.layer_idx == 0:
+                    seqlen_dbg = hidden_states.shape[0] if hidden_states.dim() == 2 else hidden_states.shape[1]
+                    if not hasattr(self, '_conv_debug_count'):
+                        self._conv_debug_count = 0
+                    if self._conv_debug_count < 10:
+                        is_fallback = conv_state is self._conv_state
+                        logger.info(
+                            f"[CONV DEBUG L0] step={self._conv_debug_count} seqlen={seqlen_dbg} "
+                            f"conv_state_id={id(conv_state)} is_fallback={is_fallback} "
+                            f"conv_norm={conv_state.norm().item():.6f} "
+                            f"conv_state[0,:3]={conv_state[0, :3].tolist() if conv_state.dim() >= 2 else 'N/A'}"
+                        )
+                        self._conv_debug_count += 1
+
+                # =============================================================
                 # PROJECTION AND EXPANSION
                 # =============================================================
                 zxbcdt = self.in_proj(hidden_states)
@@ -767,6 +783,18 @@ def _create_mamba_mixer_class():
                     # Update conv_state with last d_conv-1 inputs
                     # Take from x_with_state (which has the full history)
                     new_conv_state = x_with_state[:, :, -(self.d_conv - 1):].transpose(1, 2)
+
+                    # D-1 debug: log conv state update (layer 0, first 10 steps)
+                    if self.layer_idx == 0 and hasattr(self, '_conv_debug_count') and self._conv_debug_count <= 10:
+                        logger.info(
+                            f"[CONV UPDATE L0] seqlen={seqlen} "
+                            f"old_conv_norm={conv_state.norm().item():.6f} "
+                            f"new_conv_norm={new_conv_state.norm().item():.6f} "
+                            f"x_input_norm={x_with_state[:,:,-(self.d_conv-1):].norm().item():.6f} "
+                            f"x_conv_out_norm={x.norm().item():.6f} "
+                            f"window_vals=[{', '.join(f'{v:.4f}' for v in x_with_state[0, 0, :].tolist())}]"
+                        )
+
                     conv_state.copy_(new_conv_state)
                 else:
                     # No state available, use regular conv with padding
@@ -997,144 +1025,83 @@ class MLP(nn.Module):
 # =============================================================================
 
 class MHADecoderLayer(nn.Module):
-    """Multi-Head Attention decoder layer."""
+    """Multi-Head Attention decoder layer using vLLM's Attention for KV caching."""
 
-    def __init__(self, config: MambaInLlamaMambaConfig, layer_idx: int):
+    def __init__(self, config: MambaInLlamaMambaConfig, layer_idx: int,
+                 cache_config: "CacheConfig" = None, prefix: str = ""):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads or config.num_attention_heads
         self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_groups = self.num_heads // self.num_kv_heads
-
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
-
-        self.rotary_emb = None  # Will be initialized on first forward
-        self.rope_theta = config.rope_theta
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.scaling = self.head_dim ** -0.5
         self.max_position_embeddings = getattr(config, 'max_position_embeddings', 8192)
+
+        # Q/K/V projections (separate — matches existing weight loading)
+        self.q_proj = nn.Linear(self.hidden_size, self.q_size, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.kv_size, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, self.kv_size, bias=False)
+        self.o_proj = nn.Linear(self.q_size, self.hidden_size, bias=False)
+
+        # vLLM RoPE
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            max_position=self.max_position_embeddings,
+            rope_parameters=getattr(config, 'rope_parameters', None),
+        )
+
+        # vLLM Attention — handles KV cache, paging, GQA, masking
+        self.attn = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            cache_config=cache_config,
+            prefix=f"{prefix}.attn",
+        )
 
         self.mlp = MLP(config.hidden_size, config.intermediate_size, config.hidden_act)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def _init_rope(self, device):
-        """Initialize rotary embeddings."""
-        if self.rotary_emb is None:
-            inv_freq = 1.0 / (self.rope_theta ** (
-                torch.arange(0, self.head_dim, 2, device=device).float() / self.head_dim
-            ))
-            self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-    def _apply_rotary_pos_emb(self, q, k, positions):
-        """Apply rotary position embeddings."""
-        self._init_rope(q.device)
-
-        # positions: (batch, seq_len)
-        seq_len = positions.shape[-1] if positions.dim() > 1 else positions.shape[0]
-        positions = positions.view(-1, seq_len)
-
-        # Compute freqs in float32 for precision, then cast to input dtype
-        freqs = torch.outer(positions[0].float(), self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos().unsqueeze(0).unsqueeze(0).to(q.dtype)  # (1, 1, seq, head_dim)
-        sin = emb.sin().unsqueeze(0).unsqueeze(0).to(q.dtype)
-
-        # Apply rotation
-        def rotate_half(x):
-            x1 = x[..., : x.shape[-1] // 2]
-            x2 = x[..., x.shape[-1] // 2 :]
-            return torch.cat((-x2, x1), dim=-1)
-
-        q_embed = (q * cos) + (rotate_half(q) * sin)
-        k_embed = (k * cos) + (rotate_half(k) * sin)
-        return q_embed, k_embed
-
     def forward(
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
-        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        cache_position: int = 0,
     ) -> torch.Tensor:
-        # Handle both 2D [total_tokens, hidden] and 3D [batch, seq, hidden] input
-        input_2d = hidden_states.dim() == 2
-        logger.info(f"MHA forward: input shape={hidden_states.shape}, input_2d={input_2d}")
-        if input_2d:
-            hidden_states = hidden_states.unsqueeze(0)  # [1, total_tokens, hidden]
-            logger.info(f"MHA forward: after unsqueeze shape={hidden_states.shape}")
-
-        batch_size, seq_len, _ = hidden_states.shape
-        logger.info(f"MHA forward: batch_size={batch_size}, seq_len={seq_len}")
-
+        # hidden_states: [num_tokens, hidden_size] (2D, vLLM V1 format)
+        logger.info(f"[MHA L{self.layer_idx}] enter: hidden={hidden_states.shape} pos={positions.shape}")
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
+        # Project to Q, K, V (stay 2D)
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
-        logger.info(f"MHA forward: after proj q={q.shape}, k={k.shape}, v={v.shape}")
+        logger.info(f"[MHA L{self.layer_idx}] proj: q={q.shape} k={k.shape} v={v.shape}")
 
-        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        logger.info(f"MHA forward: after view/transpose q={q.shape}, k={k.shape}, v={v.shape}")
+        # Apply RoPE (vLLM handles position encoding)
+        q, k = self.rotary_emb(positions, q, k)
+        logger.info(f"[MHA L{self.layer_idx}] rope done: q={q.shape} k={k.shape}")
 
-        q, k = self._apply_rotary_pos_emb(q, k, positions)
-        logger.info(f"MHA forward: after rotary q={q.shape}, k={k.shape}")
+        # vLLM Attention — KV cache, paging, GQA, masking all handled internally
+        logger.info(f"[MHA L{self.layer_idx}] calling self.attn...")
+        attn_output = self.attn(q, k, v)
+        logger.info(f"[MHA L{self.layer_idx}] attn done: out={attn_output.shape}")
 
-        # KV cache handling
-        # k, v shape after transpose: [batch, num_kv_heads, seq_len, head_dim]
-        # k_cache, v_cache shape: [batch, num_kv_heads, max_seq_len, head_dim]
-        if kv_cache is not None:
-            k_cache, v_cache = kv_cache
-            cache_seq_len = k_cache.shape[2]
-
-            # During warmup, seq_len may exceed cache size - skip caching in that case
-            if cache_position + seq_len <= cache_seq_len:
-                k_cache[:, :, cache_position:cache_position+seq_len, :] = k
-                v_cache[:, :, cache_position:cache_position+seq_len, :] = v
-                k = k_cache[:, :, :cache_position+seq_len, :]
-                v = v_cache[:, :, :cache_position+seq_len, :]
-            else:
-                # Warmup/dummy run with more tokens than cache can hold - skip caching
-                logger.warning(f"seq_len ({seq_len}) + cache_position ({cache_position}) exceeds cache size ({cache_seq_len}), skipping KV cache")
-
-        # GQA expansion
-        if self.num_key_value_groups > 1:
-            k = k.repeat_interleave(self.num_key_value_groups, dim=1)
-            v = v.repeat_interleave(self.num_key_value_groups, dim=1)
-
-        # Attention
-        scale = 1.0 / math.sqrt(self.head_dim)
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
-
-        if seq_len > 1:
-            causal_mask = torch.triu(
-                torch.ones(seq_len, k.shape[-2], device=q.device, dtype=torch.bool),
-                diagonal=k.shape[-2] - seq_len + 1
-            )
-            attn_weights = attn_weights.masked_fill(causal_mask, float('-inf'))
-
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(v.dtype)
-        attn_output = torch.matmul(attn_weights, v)
-
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
         hidden_states = self.o_proj(attn_output)
         hidden_states = residual + hidden_states
 
+        # MLP
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        # Remove batch dim if we added it
-        if input_2d:
-            hidden_states = hidden_states.squeeze(0)
-
+        logger.info(f"[MHA L{self.layer_idx}] exit: out={hidden_states.shape}")
         return hidden_states
 
 
@@ -1191,7 +1158,8 @@ class MambaDecoderLayer(nn.Module):
 class MambaInLlamaMambaModel(nn.Module):
     """MambaInLlama Model backbone."""
 
-    def __init__(self, config: MambaInLlamaMambaConfig, prefix: str = ""):
+    def __init__(self, config: MambaInLlamaMambaConfig, prefix: str = "",
+                 cache_config: "CacheConfig" = None):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
@@ -1202,7 +1170,11 @@ class MambaInLlamaMambaModel(nn.Module):
         for layer_idx in range(config.num_hidden_layers):
             layer_prefix = f"{prefix}.layers.{layer_idx}" if prefix else f"model.layers.{layer_idx}"
             if layer_idx in config.attn_layers:
-                self.layers.append(MHADecoderLayer(config, layer_idx))
+                self.layers.append(MHADecoderLayer(
+                    config, layer_idx,
+                    cache_config=cache_config,
+                    prefix=layer_prefix,
+                ))
             else:
                 self.layers.append(MambaDecoderLayer(config, layer_idx, prefix=layer_prefix))
 
@@ -1216,42 +1188,26 @@ class MambaInLlamaMambaModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        mamba_cache: Optional[dict] = None,
-        attn_cache: Optional[dict] = None,
-        cache_position: int = 0,
         attn_metadata=None,
     ) -> torch.Tensor:
-        """Forward pass with vLLM state management support.
+        """Forward pass with vLLM state management.
 
         Args:
-            input_ids: Input token IDs
-            positions: Position indices for RoPE
-            mamba_cache: Optional dict mapping layer_idx to (conv_state, ssm_state)
-            attn_cache: Optional dict mapping layer_idx to (k_cache, v_cache)
-            cache_position: Current position in sequence for decode
-            attn_metadata: vLLM attention metadata for state indices
+            input_ids: Input token IDs [num_tokens] or [batch, seq]
+            positions: Position indices for RoPE [num_tokens]
+            attn_metadata: vLLM attention metadata for Mamba state indices
         """
         hidden_states = self.embed_input_ids(input_ids)
 
-        # Use empty dicts if caches not provided
-        if mamba_cache is None:
-            mamba_cache = {}
-        if attn_cache is None:
-            attn_cache = {}
-
         for i, layer in enumerate(self.layers):
             if isinstance(layer, MambaDecoderLayer):
-                conv_state, ssm_state = mamba_cache.get(i, (None, None))
                 hidden_states = layer(
                     hidden_states,
-                    conv_state=conv_state,
-                    ssm_state=ssm_state,
-                    cache_position=cache_position,
                     attn_metadata=attn_metadata,
                 )
             else:
-                kv_cache = attn_cache.get(i)
-                hidden_states = layer(hidden_states, positions, kv_cache, cache_position)
+                # MHA layer — vLLM Attention handles KV cache internally
+                hidden_states = layer(hidden_states, positions)
 
         hidden_states = self.norm(hidden_states)
         return hidden_states
@@ -1392,10 +1348,15 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
         self.vocab_size = config.vocab_size
         self.prefix = prefix
 
-        # Pass prefix to model backbone for proper layer prefix registration
+        # Extract cache_config from vllm_config for attention layers
+        cache_config = None
+        if vllm_config is not None and hasattr(vllm_config, 'cache_config'):
+            cache_config = vllm_config.cache_config
+
+        # Pass prefix and cache_config to model backbone
         model_prefix = f"{prefix}.model" if prefix else "model"
-        self.model = MambaInLlamaMambaModel(config, prefix=model_prefix)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.model = MambaInLlamaMambaModel(config, prefix=model_prefix, cache_config=cache_config)
+        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, bias=False)
 
         # vLLM components
         self._vllm_logits_processor = None
@@ -1411,8 +1372,6 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
             except:
                 pass
 
-        # Cache position tracking (for non-vLLM use)
-        self._cache_position = 0
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Convert input token IDs to embeddings (required by VllmModelForTextGeneration)."""
@@ -1430,62 +1389,16 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
     ) -> torch.Tensor:
         """vLLM-style forward pass.
 
-        With vLLM V1, state is managed by vLLM:
-        - Mamba layers get state from self.kv_cache (bound by vLLM)
-        - Attention layers get KV cache from kv_caches parameter
+        With vLLM V1:
+        - Mamba layers get state from self.kv_cache (bound by vLLM via MambaBase)
+        - Attention layers get KV cache from vLLM Attention class (via forward context)
+        - Positions and attn_metadata come from vLLM model runner
         """
-        # Handle 1D input
-        if input_ids is not None and input_ids.dim() == 1:
-            input_ids = input_ids.unsqueeze(0)
-        if positions is not None and positions.dim() == 1:
-            positions = positions.unsqueeze(0)
-
-        batch_size = input_ids.shape[0]
-        seq_len = input_ids.shape[1]
-        device = input_ids.device
-
-        # Determine if this is prefill or decode
-        is_prefill = seq_len > 1 or self._cache_position == 0
-
-        # Reset cache position for new prefill
-        if is_prefill and self._cache_position > 0:
-            self._cache_position = 0
-
-        # Create positions if not provided
-        if positions is None:
-            positions = torch.arange(
-                self._cache_position, self._cache_position + seq_len,
-                device=device
-            ).unsqueeze(0).expand(batch_size, -1)
-
-        # Build attention cache dict from vLLM's kv_caches list if provided
-        # vLLM passes kv_caches as a list where each element corresponds to a layer
-        attn_cache = {}
-        if kv_caches is not None:
-            attn_layer_indices = self.config.attn_layers or []
-            for idx, layer_idx in enumerate(attn_layer_indices):
-                if idx < len(kv_caches) and kv_caches[idx] is not None:
-                    # kv_caches[idx] is typically (k_cache, v_cache) tuple
-                    attn_cache[layer_idx] = kv_caches[idx]
-
-        # Forward through model
-        # Mamba layers get state from their own kv_cache attribute (bound by vLLM)
-        # Attention layers get cache from attn_cache dict
         hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
-            mamba_cache=None,  # Mamba layers get state from self.kv_cache
-            attn_cache=attn_cache,
-            cache_position=self._cache_position,
             attn_metadata=attn_metadata,
         )
-
-        # Update cache position
-        self._cache_position += seq_len
-
-        # Flatten for vLLM
-        if hidden_states.dim() == 3:
-            hidden_states = hidden_states.squeeze(0)
 
         return hidden_states
 
