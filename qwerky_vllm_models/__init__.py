@@ -23,7 +23,7 @@ Usage:
     vllm serve QwerkyAI/Qwerky-Llama3.1-Mamba-8B-Llama3.3-70B-base-distill
 """
 
-__version__ = "0.2.51"
+__version__ = "0.2.52"
 
 # Track if we've already registered with Transformers
 _transformers_registered = False
@@ -60,6 +60,20 @@ def register():
     """
     # First, register with Transformers so AutoConfig works
     _register_with_transformers()
+
+    # Log environment versions for debugging across machines
+    import logging
+    logger = logging.getLogger(__name__)
+    try:
+        import vllm
+        import torch
+        import transformers
+        logger.info(
+            "qwerky-vllm-models==%s, vllm==%s, torch==%s, transformers==%s",
+            __version__, vllm.__version__, torch.__version__, transformers.__version__,
+        )
+    except ImportError:
+        logger.info("qwerky-vllm-models==%s (some dependencies not yet installed)", __version__)
 
     # Then register with vLLM
     try:
