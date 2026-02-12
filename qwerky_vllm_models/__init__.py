@@ -108,6 +108,15 @@ def register():
         except Exception:
             pass
 
+    if "QwerkyLlamaMambaHybridForCausalLM" not in registered:
+        try:
+            ModelRegistry.register_model(
+                "QwerkyLlamaMambaHybridForCausalLM",
+                "qwerky_vllm_models.modeling:QwerkyLlamaMambaHybridForCausalLM"
+            )
+        except Exception:
+            pass
+
     if "MambaInLlamaMambaForCausalLMNative" not in registered:
         try:
             ModelRegistry.register_model(
@@ -124,8 +133,10 @@ def get_model_classes():
     from .modeling import (
         MambaInLlamaMambaForCausalLM,
         MambaInLlamaMambaForCausalLMNative,
+        QwerkyLlamaMambaHybridForCausalLM,
     )
     return {
         "MambaInLlamaMambaForCausalLM": MambaInLlamaMambaForCausalLM,
         "MambaInLlamaMambaForCausalLMNative": MambaInLlamaMambaForCausalLMNative,
+        "QwerkyLlamaMambaHybridForCausalLM": QwerkyLlamaMambaHybridForCausalLM,
     }

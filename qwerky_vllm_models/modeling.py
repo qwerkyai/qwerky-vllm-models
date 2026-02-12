@@ -1606,3 +1606,4 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
 # HuggingFace model configs specify "MambaInLlamaMambaForCausalLM" as the
 # architecture. This alias ensures vLLM can find and load the class.
 MambaInLlamaMambaForCausalLM = MambaInLlamaMambaForCausalLMNative
+QwerkyLlamaMambaHybridForCausalLM = MambaInLlamaMambaForCausalLMNative
