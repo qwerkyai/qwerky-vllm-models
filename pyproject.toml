@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qwerky-vllm-models"
-version = "0.2.54"
+version = "0.2.55"
 description = "vLLM plugin for Qwerky AI MambaInLlama hybrid models"
 readme = "README.md"
 license = {text = "Apache-2.0"}

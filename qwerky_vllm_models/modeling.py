@@ -773,12 +773,13 @@ def _create_mamba_mixer_class():
 
                 # Apply softplus to dt with double bias (model was trained this way)
                 # dt = W @ dt + bias (from dt_proj), now add bias again and softplus
+                # Compute in float32 for precision (matching original selective_scan_fn)
                 dt = rearrange(dt, "b l d -> b d l")
-                dt = F.softplus(dt + self.dt_proj.bias.to(dt.dtype).unsqueeze(0).unsqueeze(-1))
+                dt = F.softplus(dt.float() + self.dt_proj.bias.float().unsqueeze(0).unsqueeze(-1))
 
-                # SSM scan setup
-                # Cast A to same dtype as input to avoid float32/bfloat16 mismatch
-                A = self.A.to(x.dtype)  # Already -exp(log(A))
+                # SSM scan setup — compute in float32 for precision
+                # Original MambaInLlama uses .float() for A, D, and delta_bias
+                A = self.A.float()  # Already -exp(log(A))
                 # dA = exp(dt * A) with shape (batch, d_inner, seqlen, d_state)
                 dA = torch.exp(dt.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(2))
 
@@ -789,26 +790,27 @@ def _create_mamba_mixer_class():
                     logger.info(f"[SSM DEBUG] dA: min={dA.min().item():.4f}, max={dA.max().item():.4f}, mean={dA.mean().item():.4f}")
                     self._ssm_debug = True
 
-                # Reshape for grouped scan
-                x_grouped = rearrange(x, "b (h d) l -> b h d l", h=self.num_heads)
+                # Reshape for grouped scan — all in float32 for precision
+                x_f = x.float()
+                x_grouped = rearrange(x_f, "b (h d) l -> b h d l", h=self.num_heads)
                 dA_grouped = rearrange(dA, "b (h d) l n -> b h d l n", h=self.num_heads)
-                B_t = rearrange(B, "b l h n -> b h n l")
-                C_t = rearrange(C, "b l h n -> b h n l")
+                B_t = rearrange(B.float(), "b l h n -> b h n l")
+                C_t = rearrange(C.float(), "b l h n -> b h n l")
 
                 head_dim = self.d_inner // self.num_heads
                 dt_grouped = rearrange(dt, "b (h d) l -> b h d l", h=self.num_heads)
                 dB_u = dt_grouped.unsqueeze(3) * B_t.unsqueeze(2) * x_grouped.unsqueeze(3)
 
-                # Initialize state from ssm_state if available
+                # Initialize state from ssm_state if available (in float32)
                 # ssm_state stored as (batch, d_state, d_inner), need (batch, num_heads, head_dim, d_state)
                 if ssm_state is not None and ssm_state.numel() > 0:
                     # Transpose: (batch, d_state, d_inner) -> (batch, d_inner, d_state)
                     ssm_state_t = ssm_state.transpose(1, 2)
                     # Reshape: (batch, d_inner, d_state) -> (batch, num_heads, head_dim, d_state)
-                    state = rearrange(ssm_state_t, "b (h d) n -> b h d n", h=self.num_heads).to(x.dtype)
+                    state = rearrange(ssm_state_t, "b (h d) n -> b h d n", h=self.num_heads).float()
                 else:
                     state = torch.zeros(batch, self.num_heads, head_dim, self.d_state,
-                                       device=x.device, dtype=x.dtype)
+                                       device=x.device, dtype=torch.float32)
 
                 # Debug: log state before scan (layer 0 only, first few calls)
                 if self.layer_idx == 0 and not hasattr(self, '_debug_count'):
@@ -837,13 +839,15 @@ def _create_mamba_mixer_class():
                     # Transpose back: (batch, d_inner, d_state) -> (batch, d_state, d_inner)
                     ssm_state.copy_(final_state.transpose(1, 2))
 
-                y = torch.stack(outputs, dim=-1)
+                y = torch.stack(outputs, dim=-1)  # float32
                 y = rearrange(y, "b h d l -> b (h d) l")
 
-                # Skip connection and gate
-                # Cast D to input dtype to avoid float32/bfloat16 mismatch
-                y = y + self.D.to(x.dtype).unsqueeze(0).unsqueeze(-1) * x
-                y = y * F.silu(z)
+                # Skip connection and gate (in float32, matching original)
+                y = y + self.D.float().unsqueeze(0).unsqueeze(-1) * x_f
+                y = y * F.silu(z.float())
+
+                # Cast back to input dtype
+                y = y.to(x.dtype)
 
                 y = rearrange(y, "b d l -> b l d")
 
