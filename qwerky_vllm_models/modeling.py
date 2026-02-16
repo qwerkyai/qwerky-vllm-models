@@ -87,9 +87,11 @@ try:
         ParallelLMHead,
     )
     from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+    from vllm.model_executor.utils import set_weight_attrs
     from vllm.attention.layer import Attention
     from vllm.model_executor.layers.rotary_embedding import get_rope
     from vllm.distributed import get_tensor_model_parallel_world_size
+    from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
     from vllm.config import VllmConfig, CacheConfig, ModelConfig, get_current_vllm_config
     from vllm.model_executor.layers.activation import SiluAndMul
     from vllm.forward_context import ForwardContext, get_forward_context
@@ -270,52 +272,80 @@ if _MambaBase is not None and _CustomOp is not None:
             self.repeat_kv_before_conv = config.ssm_cfg.get("repeat_kv_before_conv", True)
             self.conv_dim = self.d_inner if self.repeat_kv_before_conv else self.d_xb
 
+            # TP dimensions — per-partition sizes for forward split
+            tp_size = get_tensor_model_parallel_world_size()
+            self.d_inner_local = self.d_inner // tp_size
+            self.d_xb_local = self.d_xb // tp_size
+            self.dt_rank_local = self.dt_rank // tp_size
+            self.conv_dim_local = self.conv_dim // tp_size
+            self.num_heads_local = self.num_heads // tp_size
+            self.num_xb_head_local = self.num_xb_head // tp_size
+
             # Fused input projection: [z, x, B, C, dt]
             # z: d_inner, x: d_xb, B: d_xb, C: d_inner, dt: dt_rank
-            self.in_proj = nn.Linear(
+            # MergedColumnParallelLinear shards each output by tp_size
+            self.in_proj = MergedColumnParallelLinear(
                 self.d_model,
-                2 * self.d_inner + 2 * self.d_xb + self.dt_rank,
+                [self.d_inner, self.d_xb, self.d_xb, self.d_inner, self.dt_rank],
                 bias=False,
+                prefix=f"{prefix}.in_proj",
             )
 
-            # Conv1d - depthwise convolution
-            self.conv1d = nn.Conv1d(
-                in_channels=self.conv_dim,
-                out_channels=self.conv_dim,
-                kernel_size=self.d_conv,
-                groups=self.conv_dim,
-                padding=self.d_conv - 1,
+            # Conv1d as ColumnParallelLinear (matching vLLM MambaMixer pattern)
+            # Weight shape: (conv_dim, 1, d_conv) stored as (conv_dim, d_conv)
+            self.conv1d = ColumnParallelLinear(
+                input_size=self.d_conv,
+                output_size=self.conv_dim,
                 bias=True,
+                prefix=f"{prefix}.conv1d",
+            )
+            # Unsqueeze to fit conv1d weight shape into linear weight shape
+            self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
+
+            # Delta time projection (bias applied in forward, then again via
+            # delta_bias for double-bias matching the trained model)
+            self.dt_proj = ColumnParallelLinear(
+                self.dt_rank,
+                self.d_inner,
+                bias=True,
+                prefix=f"{prefix}.dt_proj",
             )
 
-            # Delta time projection
-            self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
+            # A matrix with TP-aware weight loading
+            # Checkpoint stores A_log, weight_loader converts: A = -exp(A_log)
+            def _weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
+                tp_rank = get_tensor_model_parallel_rank()
+                tp_sz = get_tensor_model_parallel_world_size()
+                param.data.copy_(
+                    loaded_weight.data.split(
+                        loaded_weight.shape[0] // tp_sz, dim=0
+                    )[tp_rank]
+                )
 
-            # Initialize dt_proj bias with inverse softplus
-            dt_min, dt_max = 0.001, 0.1
-            dt = torch.exp(
-                torch.rand(self.d_inner) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
-            ).clamp(min=1e-4)
-            inv_dt = dt + torch.log(-torch.expm1(-dt))
-            with torch.no_grad():
-                self.dt_proj.bias.copy_(inv_dt)
+            def _A_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
+                _weight_loader(param, -torch.exp(loaded_weight.float()))
 
-            # A matrix (stored as -exp for vLLM ops)
-            A = repeat(
-                torch.arange(1, self.d_state + 1, dtype=torch.float32),
-                "n -> d n",
-                d=self.d_inner,
-            ).contiguous()
-            # Store as -exp(log(A)) = -A for direct use in SSM
-            self.A = nn.Parameter(-A)
-            self.A._no_weight_decay = True
+            self.A = nn.Parameter(
+                torch.empty(
+                    self.d_inner // tp_size,
+                    self.d_state,
+                    dtype=torch.float32,
+                )
+            )
+            set_weight_attrs(self.A, {"weight_loader": _A_weight_loader})
 
-            # D skip parameter
-            self.D = nn.Parameter(torch.ones(self.d_inner))
-            self.D._no_weight_decay = True
+            # D skip parameter with TP-aware weight loading
+            self.D = nn.Parameter(torch.ones(self.d_inner // tp_size))
+            set_weight_attrs(self.D, {"weight_loader": _weight_loader})
 
-            # Output projection
-            self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=False)
+            # Output projection (all-reduce across TP ranks)
+            self.out_proj = RowParallelLinear(
+                self.d_inner,
+                self.d_model,
+                bias=False,
+                input_is_parallel=True,
+                prefix=f"{prefix}.out_proj",
+            )
 
             self.activation = "silu"
 
@@ -342,12 +372,21 @@ if _MambaBase is not None and _CustomOp is not None:
         def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
             """Return state shapes for vLLM cache allocation.
 
-            Convention matches vLLM mamba_utils.py mamba1_state_shape():
-            - conv_state: (d_conv-1, conv_dim) — swapped so conv_dim stride=1
-            - ssm_state: (d_inner, d_state)
+            Uses MambaStateShapeCalculator for standard case (conv_dim == d_inner).
+            Falls back to manual calculation for non-standard conv_dim.
+            Convention: conv_state (d_conv-1, conv_dim), ssm_state (d_inner, d_state).
             """
-            conv_state_shape = (self.d_conv - 1, self.conv_dim)
-            ssm_state_shape = (self.d_inner, self.d_state)
+            tp_size = get_tensor_model_parallel_world_size()
+            if (self.conv_dim == self.d_inner
+                    and _vllm_MambaStateShapeCalculator is not None):
+                return _vllm_MambaStateShapeCalculator.mamba1_state_shape(
+                    tp_world_size=tp_size,
+                    intermediate_size=self.d_inner,
+                    state_size=self.d_state,
+                    conv_kernel=self.d_conv,
+                )
+            conv_state_shape = (self.d_conv - 1, self.conv_dim // tp_size)
+            ssm_state_shape = (self.d_inner // tp_size, self.d_state)
             return (conv_state_shape, ssm_state_shape)
 
         def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
@@ -399,7 +438,9 @@ if _MambaBase is not None and _CustomOp is not None:
             if attn_metadata is None:
                 # V1 profile run — write dummy output
                 num_tokens = hidden_states.shape[0]
-                output[:num_tokens] = self.out_proj(hidden_states[..., :self.d_inner])
+                output[:num_tokens] = self.out_proj(
+                    hidden_states[..., :self.d_inner_local]
+                )[0]
                 return
 
             assert isinstance(attn_metadata, dict)
@@ -456,19 +497,22 @@ if _MambaBase is not None and _CustomOp is not None:
 
             # ===== PROJECTION =====
             # Process all tokens (including CUDA graph padding) through in_proj
-            zxbcdt = self.in_proj(hidden_states)
+            # MergedColumnParallelLinear returns (output, bias) tuple
+            zxbcdt = self.in_proj(hidden_states)[0]
             z, x, B, C, dt = torch.split(
                 zxbcdt,
-                [self.d_inner, self.d_xb, self.d_xb, self.d_inner, self.dt_rank],
+                [self.d_inner_local, self.d_xb_local, self.d_xb_local,
+                 self.d_inner_local, self.dt_rank_local],
                 dim=-1,
             )
 
             # Delta time projection WITH bias (model trained with double bias)
-            dt = self.dt_proj(dt)
+            # ColumnParallelLinear returns (output, bias) tuple
+            dt = self.dt_proj(dt)[0]
 
             # Expand x via repeat_interleave if needed
             if self.repeat_kv_before_conv:
-                x = rearrange(x, "t (g d) -> t g d", g=self.num_xb_head)
+                x = rearrange(x, "t (g d) -> t g d", g=self.num_xb_head_local)
                 x = torch.repeat_interleave(x, self.repeat_group, dim=-2)
                 x = rearrange(x, "t g d -> t (g d)")
 
@@ -476,10 +520,10 @@ if _MambaBase is not None and _CustomOp is not None:
             B = rearrange(B, "t (g d) -> t g d", d=self.d_state)
             B = torch.repeat_interleave(B, self.repeat_group, dim=-2)
 
-            # C is already d_inner, just reshape
+            # C is already d_inner_local, just reshape
             C = rearrange(C, "t (g d) -> t g d", d=self.d_state)
 
-            # Conv weight: (conv_dim, d_conv) from (conv_dim, 1, d_conv)
+            # Conv weight: (conv_dim_local, d_conv) from (conv_dim_local, 1, d_conv)
             conv_weight = rearrange(self.conv1d.weight, "d 1 w -> d w")
 
             D = self.D.float()
@@ -581,7 +625,7 @@ if _MambaBase is not None and _CustomOp is not None:
                 # The kernel asserts nheads % ngroups == 0, so we reshape
                 # state/x/dt/z to (*, nheads, head_dim, ...) format.
                 # Double bias: dt already has bias from dt_proj, dt_bias adds it again
-                nheads = self.num_heads   # d_inner // d_state
+                nheads = self.num_heads_local
                 head_dim = self.d_state
 
                 x_mh = x_conv_d.view(-1, nheads, head_dim)
@@ -611,19 +655,20 @@ if _MambaBase is not None and _CustomOp is not None:
                     out=scan_outputs_d,
                 )
 
-                # Reshape back to (d_inner, num_decode) for cat with prefill
+                # Reshape back to (d_inner_local, num_decode) for cat with prefill
                 scan_outputs_d = scan_outputs_d.reshape(
-                    -1, self.d_inner
+                    -1, self.d_inner_local
                 ).transpose(0, 1)
 
                 ssm_outputs.insert(0, scan_outputs_d)  # decode comes first
 
             # Combine and project
+            # RowParallelLinear returns (output, bias) tuple
             y_combined = (
                 ssm_outputs[0] if len(ssm_outputs) == 1
                 else torch.cat(ssm_outputs, dim=-1)
             )
-            out = self.out_proj(y_combined.transpose(0, 1))
+            out = self.out_proj(y_combined.transpose(0, 1))[0]
             output[:num_actual_tokens] = out
 
 else:
@@ -1181,141 +1226,106 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
         return None
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights from checkpoint.
+        """Load weights from checkpoint using vLLM weight_loader pattern.
 
         Handles weight name transformations:
         1. mha.in_proj.weight -> split into q_proj, k_proj, v_proj
         2. mha.out_proj.weight -> rename to o_proj.weight
+        3. mamba.A_log -> mamba.A (via set_weight_attrs weight_loader)
+        4. mamba.in_proj.weight -> split into 5 shards for MergedColumnParallelLinear
         """
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
-        skipped_weights = []
 
-        # Log model parameter names for debugging (first 10)
-        param_names = list(params_dict.keys())
-        logger.info(f"Model has {len(param_names)} parameters")
-        logger.info(f"First 20 model params: {param_names[:20]}")
+        # Mamba in_proj shard sizes: [z, x, B, C, dt]
+        d_inner = self.config.d_inner
+        d_xb = self.config.d_xb
+        dt_rank = math.ceil(self.config.d_model / 16)
+        mamba_in_proj_sizes = [d_inner, d_xb, d_xb, d_inner, dt_rank]
 
-        # Get dimensions for attention splitting
-        # Q: num_heads * head_dim, K/V: num_kv_heads * head_dim
+        # MHA attention dimensions for QKV split
         num_heads = self.config.num_attention_heads
         num_kv_heads = self.config.num_key_value_heads or num_heads
         head_dim = self.config.hidden_size // num_heads
-        q_dim = num_heads * head_dim  # 4096 for 32 heads * 128 dim
-        kv_dim = num_kv_heads * head_dim  # 1024 for 8 heads * 128 dim
+        q_dim = num_heads * head_dim
+        kv_dim = num_kv_heads * head_dim
 
-        logger.info(f"Attention dims: q_dim={q_dim}, kv_dim={kv_dim}, head_dim={head_dim}")
-
-        checkpoint_names = []
         for name, loaded_weight in weights:
-            checkpoint_names.append(name)
-            # Log first 20 checkpoint weight names
-            if len(checkpoint_names) <= 20:
-                logger.info(f"Checkpoint weight: {name} shape={loaded_weight.shape}")
-
-            # Handle fused attention in_proj -> split into q, k, v
+            # === MHA attention: fused in_proj -> split into q, k, v ===
             if ".mha.in_proj.weight" in name:
-                # Split fused QKV weight: [q_dim + kv_dim + kv_dim, hidden]
                 base_name = name.replace(".mha.in_proj.weight", "")
-
                 q_weight = loaded_weight[:q_dim, :]
                 k_weight = loaded_weight[q_dim:q_dim + kv_dim, :]
                 v_weight = loaded_weight[q_dim + kv_dim:, :]
-
-                found_any = False
                 for suffix, weight in [(".q_proj.weight", q_weight),
                                        (".k_proj.weight", k_weight),
                                        (".v_proj.weight", v_weight)]:
                     param_name = base_name + suffix
                     if param_name in params_dict:
-                        params_dict[param_name].data.copy_(weight)
+                        param = params_dict[param_name]
+                        weight_loader = getattr(param, "weight_loader",
+                                                default_weight_loader)
+                        weight_loader(param, weight)
                         loaded_params.add(param_name)
-                        found_any = True
-                    else:
-                        skipped_weights.append(f"{name} -> {param_name} (param not found - is attn_layers configured?)")
-                if not found_any:
-                    logger.warning(f"Attention layer weights {name} found but no q/k/v params exist. Check attn_layers config!")
                 continue
 
-            # Handle attention out_proj rename
-            if ".mha.out_proj.weight" in name:
+            # === MHA attention: out_proj rename ===
+            if ".mha.out_proj." in name:
                 new_name = name.replace(".mha.out_proj.", ".o_proj.")
                 if new_name in params_dict:
-                    params_dict[new_name].data.copy_(loaded_weight)
+                    param = params_dict[new_name]
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
+                    weight_loader(param, loaded_weight)
                     loaded_params.add(new_name)
                 continue
 
-            # Handle attention out_proj bias if present
-            if ".mha.out_proj.bias" in name:
-                new_name = name.replace(".mha.out_proj.", ".o_proj.")
-                if new_name in params_dict:
-                    params_dict[new_name].data.copy_(loaded_weight)
-                    loaded_params.add(new_name)
-                continue
-
-            # Handle A_log -> A conversion for Mamba layers
-            # Checkpoint stores A_log, we need A = -exp(A_log) as per Mamba paper
+            # === Mamba A_log -> A (weight_loader handles conversion + TP) ===
             if ".mamba.A_log" in name:
                 new_name = name.replace(".mamba.A_log", ".mamba.A")
                 if new_name in params_dict:
                     param = params_dict[new_name]
-                    # A = -exp(A_log) as per Mamba paper
-                    converted = -torch.exp(loaded_weight)
-                    if param.shape == converted.shape:
-                        param.data.copy_(converted)
-                        loaded_params.add(new_name)
-                        continue
-                    else:
-                        skipped_weights.append(f"{name} -> {new_name} (shape mismatch: {converted.shape} vs {param.shape})")
-                        continue
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add(new_name)
+                continue
 
-            # Try direct match
-            if name in params_dict:
-                param = params_dict[name]
-                if param.shape == loaded_weight.shape:
-                    param.data.copy_(loaded_weight)
-                    loaded_params.add(name)
-                    continue
+            # === Mamba in_proj: split fused weight into 5 shards ===
+            if ".mamba.in_proj.weight" in name:
+                param_name = name
+                if param_name not in params_dict:
+                    param_name = f"model.{name}" if not name.startswith("model.") else name[6:]
+                if param_name in params_dict:
+                    param = params_dict[param_name]
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
+                    shards = torch.split(loaded_weight, mamba_in_proj_sizes, dim=0)
+                    for shard_id, shard_weight in enumerate(shards):
+                        weight_loader(param, shard_weight, shard_id)
+                    loaded_params.add(param_name)
+                continue
 
-            # Try with/without model prefix
-            candidates = [name]
-            if name.startswith("model."):
-                candidates.append(name[6:])
-            else:
-                candidates.append(f"model.{name}")
+            # === Default: use weight_loader if available ===
+            param_name = name
+            if param_name not in params_dict:
+                # Try with/without model prefix
+                if name.startswith("model."):
+                    param_name = name[6:]
+                else:
+                    param_name = f"model.{name}"
 
-            matched = False
-            for candidate in candidates:
-                if candidate in params_dict:
-                    param = params_dict[candidate]
-                    if param.shape == loaded_weight.shape:
-                        param.data.copy_(loaded_weight)
-                        loaded_params.add(candidate)
-                        matched = True
-                        break
-                    else:
-                        skipped_weights.append(f"{name} (shape mismatch: checkpoint {loaded_weight.shape} vs model {param.shape})")
-                        matched = True  # Don't add to skipped again
-                        break
+            if param_name in params_dict:
+                param = params_dict[param_name]
+                weight_loader = getattr(param, "weight_loader",
+                                        default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(param_name)
 
-            if not matched:
-                skipped_weights.append(f"{name} (no matching param)")
-
-        logger.info(f"Loaded {len(loaded_params)}/{len(params_dict)} parameters from {len(checkpoint_names)} checkpoint weights")
-        if skipped_weights:
-            logger.info(f"Skipped {len(skipped_weights)} checkpoint weights. First 20:")
-            for w in skipped_weights[:20]:
-                logger.info(f"  - {w}")
-
-        # Log model params that weren't loaded (helps diagnose attn_layers issues)
+        logger.info(f"Loaded {len(loaded_params)}/{len(params_dict)} parameters")
         if len(loaded_params) < len(params_dict):
-            missing_params = len(params_dict) - len(loaded_params)
-            logger.warning(f"{missing_params} model parameters may not have been loaded from checkpoint!")
-            logger.info(f"Config attn_layers: {self.config.attn_layers}")
-            # Show some attention-related params to help debug
-            attn_params = [p for p in param_names if 'q_proj' in p or 'k_proj' in p or 'v_proj' in p or 'o_proj' in p]
-            if attn_params:
-                logger.info(f"Model has {len(attn_params)} attention params: {attn_params[:8]}...")
+            missing = set(params_dict.keys()) - loaded_params
+            logger.warning(f"{len(missing)} params not loaded: {list(missing)[:10]}...")
 
         return loaded_params
 

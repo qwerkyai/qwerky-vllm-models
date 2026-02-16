@@ -40,6 +40,14 @@ This package uses vLLM's plugin system (`vllm.general_plugins` entry point) to r
 
 ## Changelog
 
+### 0.2.62
+- **Tensor parallelism support**: Replace `nn.Linear` with vLLM parallel layers (`MergedColumnParallelLinear`, `RowParallelLinear`, `ColumnParallelLinear`)
+- **TP-aware weight loading**: `set_weight_attrs` for A and D parameters with custom weight_loaders for TP sharding and A_log→A conversion
+- **Rewrite `load_weights`** to use vLLM `weight_loader` pattern for all parameters
+- **Conv1d as ColumnParallelLinear**: Matches vLLM MambaMixer pattern, enables TP sharding of conv weights
+- **Per-partition dimension tracking**: `d_inner_local`, `d_xb_local`, etc. for correct TP operation
+- **TP-aware state shapes**: `get_state_shape()` uses `MambaStateShapeCalculator` for TP-correct cache allocation
+
 ### 0.2.61
 - **Prefix caching support**: Pass `block_idx_first_scheduled_token`, `block_idx_last_scheduled_token`, `initial_state_idx`, `num_computed_tokens`, and `block_size_to_align` to `causal_conv1d_fn` and `selective_scan_fn`
 - **Separate read/write state indices for decode**: Compute `state_indices_d_input` and `state_indices_d_output` via `.gather()` when prefix caching is enabled
