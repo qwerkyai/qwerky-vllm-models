@@ -336,11 +336,11 @@ if _MambaBase is not None and _CustomOp is not None:
         def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
             """Return state shapes for vLLM cache allocation.
 
-            Convention matches vLLM reference:
-            - conv_state: (conv_dim, d_conv-1) — used directly by ops
-            - ssm_state: (d_inner, d_state) — used directly by ops
+            Convention matches vLLM mamba_utils.py mamba1_state_shape():
+            - conv_state: (d_conv-1, conv_dim) — swapped so conv_dim stride=1
+            - ssm_state: (d_inner, d_state)
             """
-            conv_state_shape = (self.conv_dim, self.d_conv - 1)
+            conv_state_shape = (self.d_conv - 1, self.conv_dim)
             ssm_state_shape = (self.d_inner, self.d_state)
             return (conv_state_shape, ssm_state_shape)
 
@@ -401,8 +401,9 @@ if _MambaBase is not None and _CustomOp is not None:
 
             # Get state from kv_cache (bound by vLLM V1)
             self_kv_cache = self.kv_cache[forward_context.virtual_engine]
-            # conv_state: (pool, conv_dim, d_conv-1) — used directly by ops
-            conv_state = self_kv_cache[0]
+            # Allocated as (pool, d_conv-1, conv_dim), transpose to
+            # (pool, conv_dim, d_conv-1) so stride(1)=1 for causal_conv1d ops
+            conv_state = self_kv_cache[0].transpose(-1, -2)
             # ssm_state: (pool, d_inner, d_state) — used directly by ops
             ssm_state = self_kv_cache[1]
 
@@ -605,7 +606,7 @@ else:
             self.kv_cache: tuple[torch.Tensor, ...] = (torch.tensor([]), torch.tensor([]))
 
         def get_state_shape(self):
-            conv_state_shape = (self.conv_dim, self.d_conv - 1)
+            conv_state_shape = (self.d_conv - 1, self.conv_dim)
             ssm_state_shape = (self.d_inner, self.d_state)
             return (conv_state_shape, ssm_state_shape)
 

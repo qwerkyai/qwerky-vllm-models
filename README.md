@@ -39,6 +39,11 @@ This package uses vLLM's plugin system (`vllm.general_plugins` entry point) to r
 
 ## Changelog
 
+### 0.2.59
+- **FIX**: Conv state shape must be `(d_conv-1, conv_dim)` not `(conv_dim, d_conv-1)`
+- vLLM's `causal_conv1d_fn` asserts `stride_istate_dim == 1` (conv_dim must be contiguous)
+- Matches vLLM's `mamba_utils.py:mamba1_state_shape()` which swaps the axes
+
 ### 0.2.58
 - **FIX**: Register `mambainllama_mixer` custom op via `direct_register_custom_op`
 - `@CustomOp.register()` only adds to vLLM's internal registry, does not create a `torch.ops.vllm.*` callable
