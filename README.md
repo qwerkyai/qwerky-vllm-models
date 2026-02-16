@@ -29,6 +29,7 @@ This package uses vLLM's plugin system (`vllm.general_plugins` entry point) to r
 - No fork of vLLM required
 - No `--trust-remote-code` flag needed
 - Works with standard vLLM installation
+- CUDA graph support for optimized decode latency
 - Uses vLLM's native Triton-accelerated Mamba kernels
 
 ## Requirements
@@ -38,6 +39,13 @@ This package uses vLLM's plugin system (`vllm.general_plugins` entry point) to r
 - PyTorch >= 2.0.0
 
 ## Changelog
+
+### 0.2.61
+- **Prefix caching support**: Pass `block_idx_first_scheduled_token`, `block_idx_last_scheduled_token`, `initial_state_idx`, `num_computed_tokens`, and `block_size_to_align` to `causal_conv1d_fn` and `selective_scan_fn`
+- **Separate read/write state indices for decode**: Compute `state_indices_d_input` and `state_indices_d_output` via `.gather()` when prefix caching is enabled
+- **`dst_state_batch_indices` support**: Pass to `selective_state_update` for correct state write-back with prefix caching
+- **Prefix caching params for decode conv**: Pass `block_idx_last_scheduled_token` and `initial_state_idx` to `causal_conv1d_update`
+- Store `mamba_block_size` from cache config
 
 ### 0.2.60
 - **MAJOR FIX**: Rewrite decode path to match vLLM kernel conventions

@@ -23,7 +23,7 @@ Usage:
     vllm serve QwerkyAI/Qwerky-Llama3.1-Mamba-8B-Llama3.3-70B-base-distill
 """
 
-__version__ = "0.2.60"
+__version__ = "0.2.61"
 
 # Track if we've already registered with Transformers
 _transformers_registered = False

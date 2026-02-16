@@ -319,6 +319,12 @@ if _MambaBase is not None and _CustomOp is not None:
 
             self.activation = "silu"
 
+            # Store cache config for prefix caching support
+            self.mamba_block_size = (
+                cache_config.mamba_block_size
+                if cache_config is not None else 0
+            )
+
             # Register in static_forward_context (unconditionally)
             # Required for V1 cache discovery and custom op dispatch
             compilation_config = get_current_vllm_config().compilation_config
@@ -416,6 +422,38 @@ if _MambaBase is not None and _CustomOp is not None:
             has_prefill = num_prefill_tokens > 0
             has_decode = num_decode_tokens > 0
 
+            # Prefix caching: extract block_idx fields for state read/write
+            prefix_caching_enabled = (
+                self.cache_config is not None
+                and self.cache_config.enable_prefix_caching
+            )
+            if prefix_caching_enabled:
+                block_idx_last_computed_token_d, block_idx_last_computed_token_p = (
+                    torch.split(
+                        layer_metadata.block_idx_last_computed_token,
+                        [num_decode_tokens, num_prefills],
+                        dim=0,
+                    )
+                )
+                block_idx_last_scheduled_token_d, block_idx_last_scheduled_token_p = (
+                    torch.split(
+                        layer_metadata.block_idx_last_scheduled_token,
+                        [num_decode_tokens, num_prefills],
+                        dim=0,
+                    )
+                )
+                block_idx_first_scheduled_token_p = (
+                    layer_metadata.block_idx_first_scheduled_token_p
+                )
+                num_computed_tokens_p = layer_metadata.num_computed_tokens_p
+            else:
+                block_idx_last_computed_token_d = None
+                block_idx_last_computed_token_p = None
+                block_idx_last_scheduled_token_d = None
+                block_idx_last_scheduled_token_p = None
+                block_idx_first_scheduled_token_p = None
+                num_computed_tokens_p = None
+
             # ===== PROJECTION =====
             # Process all tokens (including CUDA graph padding) through in_proj
             zxbcdt = self.in_proj(hidden_states)
@@ -473,6 +511,11 @@ if _MambaBase is not None and _CustomOp is not None:
                     cache_indices=state_indices_p,
                     has_initial_state=has_initial_states_p,
                     activation="silu",
+                    block_idx_first_scheduled_token=block_idx_first_scheduled_token_p,
+                    block_idx_last_scheduled_token=block_idx_last_scheduled_token_p,
+                    initial_state_idx=block_idx_last_computed_token_p,
+                    num_computed_tokens=num_computed_tokens_p,
+                    block_size_to_align=self.mamba_block_size,
                 )
 
                 # SSM scan
@@ -491,6 +534,10 @@ if _MambaBase is not None and _CustomOp is not None:
                     query_start_loc=query_start_loc_p,
                     cache_indices=state_indices_p,
                     has_initial_state=has_initial_states_p,
+                    block_size=self.mamba_block_size,
+                    block_idx_first_scheduled_token=block_idx_first_scheduled_token_p,
+                    block_idx_last_scheduled_token=block_idx_last_scheduled_token_p,
+                    initial_state_idx=block_idx_last_computed_token_p,
                 )
 
                 ssm_outputs.append(y_p)
@@ -505,6 +552,18 @@ if _MambaBase is not None and _CustomOp is not None:
 
                 state_indices_d = state_indices[:num_decode_tokens]
 
+                # Prefix caching: separate read/write state indices
+                if prefix_caching_enabled:
+                    state_indices_d_input = state_indices_d.gather(
+                        1, block_idx_last_computed_token_d.unsqueeze(1)
+                    ).squeeze(1)
+                    state_indices_d_output = state_indices_d.gather(
+                        1, block_idx_last_scheduled_token_d.unsqueeze(1)
+                    ).squeeze(1)
+                else:
+                    state_indices_d_input = state_indices_d
+                    state_indices_d_output = state_indices_d
+
                 # Conv update — batch-first: (num_decode, d_inner)
                 # causal_conv1d_update expects x=(batch, dim), NOT (dim, batch)
                 x_conv_d = causal_conv1d_update(
@@ -514,6 +573,8 @@ if _MambaBase is not None and _CustomOp is not None:
                     bias=self.conv1d.bias,
                     activation="silu",
                     conv_state_indices=state_indices_d,
+                    block_idx_last_scheduled_token=block_idx_last_scheduled_token_d,
+                    initial_state_idx=block_idx_last_computed_token_d,
                 )
 
                 # SSM state update — multi-head format for selective_state_update
@@ -545,7 +606,8 @@ if _MambaBase is not None and _CustomOp is not None:
                     z=z_mh,
                     dt_bias=dt_bias_mh,
                     dt_softplus=True,
-                    state_batch_indices=state_indices_d,
+                    state_batch_indices=state_indices_d_input,
+                    dst_state_batch_indices=state_indices_d_output,
                     out=scan_outputs_d,
                 )
 
