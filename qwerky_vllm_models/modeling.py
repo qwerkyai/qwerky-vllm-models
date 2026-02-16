@@ -92,6 +92,7 @@ try:
     from vllm.model_executor.layers.rotary_embedding import get_rope
     from vllm.distributed import get_tensor_model_parallel_world_size
     from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
+    from vllm.platforms import current_platform
     from vllm.config import VllmConfig, CacheConfig, ModelConfig, get_current_vllm_config
     from vllm.model_executor.layers.activation import SiluAndMul
     from vllm.forward_context import ForwardContext, get_forward_context
@@ -249,12 +250,14 @@ if _MambaBase is not None and _CustomOp is not None:
             prefix: str = "",
             model_config: "ModelConfig | None" = None,
             cache_config: "CacheConfig | None" = None,
+            is_lora_enabled: bool = False,
         ):
             super().__init__()
             self.layer_idx = layer_idx
             self.prefix = prefix
             self.model_config = model_config
             self.cache_config = cache_config
+            self.is_lora_enabled = is_lora_enabled
 
             # Core dimensions
             self.d_model = config.d_model
@@ -498,6 +501,10 @@ if _MambaBase is not None and _CustomOp is not None:
             # ===== PROJECTION =====
             # Process all tokens (including CUDA graph padding) through in_proj
             # MergedColumnParallelLinear returns (output, bias) tuple
+            # LoRA kernel requires contiguous tensor; ROCm non-contiguous
+            # causes incorrect GEMM results when batch > 1
+            if self.is_lora_enabled or current_platform.is_rocm():
+                hidden_states = hidden_states.contiguous()
             zxbcdt = self.in_proj(hidden_states)[0]
             z, x, B, C, dt = torch.split(
                 zxbcdt,
@@ -668,7 +675,13 @@ if _MambaBase is not None and _CustomOp is not None:
                 ssm_outputs[0] if len(ssm_outputs) == 1
                 else torch.cat(ssm_outputs, dim=-1)
             )
-            out = self.out_proj(y_combined.transpose(0, 1))[0]
+            if self.is_lora_enabled:
+                # LoRA kernel requires contiguous tensor
+                out = self.out_proj(
+                    y_combined.transpose(0, 1).contiguous()
+                )[0]
+            else:
+                out = self.out_proj(y_combined.transpose(0, 1))[0]
             output[:num_actual_tokens] = out
 
 else:

@@ -40,6 +40,12 @@ This package uses vLLM's plugin system (`vllm.general_plugins` entry point) to r
 
 ## Changelog
 
+### 0.2.63
+- **LoRA support**: `is_lora_enabled` parameter, contiguity enforcement for LoRA kernel
+- **ROCm platform check**: `current_platform.is_rocm()` contiguity for non-contiguous GEMM correctness
+- **LoRA-aware output projection**: Separate contiguous path for LoRA kernel compatibility
+- **Speculative decoding ready**: `selective_state_update` and `causal_conv1d_update` accept `num_accepted_tokens` (kernel-level plumbing in place)
+
 ### 0.2.62
 - **Tensor parallelism support**: Replace `nn.Linear` with vLLM parallel layers (`MergedColumnParallelLinear`, `RowParallelLinear`, `ColumnParallelLinear`)
 - **TP-aware weight loading**: `set_weight_attrs` for A and D parameters with custom weight_loaders for TP sharding and A_log→A conversion
