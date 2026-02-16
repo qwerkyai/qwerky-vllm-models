@@ -93,6 +93,7 @@ try:
     from vllm.config import VllmConfig, CacheConfig, ModelConfig, get_current_vllm_config
     from vllm.model_executor.layers.activation import SiluAndMul
     from vllm.forward_context import ForwardContext, get_forward_context
+    from vllm.utils.torch_utils import direct_register_custom_op
 
     _vllm_available = True
     logger.info("vLLM core components loaded successfully")
@@ -651,6 +652,34 @@ else:
             if output is not None:
                 output[:result.shape[0]] = result
             return result
+
+
+# Register the custom op so torch.ops.vllm.mambainllama_mixer exists.
+# This is what makes the custom op pattern work — forward() calls the op,
+# the op looks up the layer by prefix and calls forward_cuda().
+if _vllm_available:
+    def _mambainllama_mixer_op(
+        hidden_states: torch.Tensor,
+        output: torch.Tensor,
+        layer_name: str,
+    ) -> None:
+        forward_context: ForwardContext = get_forward_context()
+        self = forward_context.no_compile_layers[layer_name]
+        self.forward_cuda(hidden_states=hidden_states, output=output)
+
+    def _mambainllama_mixer_fake(
+        hidden_states: torch.Tensor,
+        output: torch.Tensor,
+        layer_name: str,
+    ) -> None:
+        return
+
+    direct_register_custom_op(
+        op_name="mambainllama_mixer",
+        op_func=_mambainllama_mixer_op,
+        mutates_args=["output"],
+        fake_impl=_mambainllama_mixer_fake,
+    )
 
 
 # =============================================================================
