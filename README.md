@@ -39,6 +39,59 @@ This package uses vLLM's plugin system (`vllm.general_plugins` entry point) to r
 
 ## Changelog
 
+### 0.2.58
+- **FIX**: Register `mambainllama_mixer` custom op via `direct_register_custom_op`
+- `@CustomOp.register()` only adds to vLLM's internal registry, does not create a `torch.ops.vllm.*` callable
+- Now properly creates the torch op that `forward()` dispatches through
+
+### 0.2.57
+- **FIX**: Custom op name mismatch — `forward()` called `torch.ops.vllm.mamba_mixer` but op was registered as `mambainllama_mixer`
+
+### 0.2.56
+- **MAJOR**: CUDA graph support via custom op pattern
+- Adopt vLLM's `MambaBase + CustomOp` pattern for CUDA graph compatibility
+- `torch.ops.vllm.mambainllama_mixer` dispatch acts as compiler breakpoint
+- Fix state shapes: conv `(conv_dim, d_conv-1)`, ssm `(d_inner, d_state)` — no transpose needed
+- Output tensor pattern for custom op compatibility
+- `VocabParallelEmbedding`, `load_weights` returns `set[str]`
+- Remove factory pattern, fallback state management, `is_attention_free`
+
+### 0.2.55
+- **FIX**: Compute SSM scan in float32 to match original `selective_scan_fn` precision
+- bfloat16 at dA~0.98 causes ~55% cumulative error over 100 steps
+
+### 0.2.54
+- **MAJOR**: Use vLLM's `Attention` class for MHA layers
+- Replaced manual attention with vLLM's native Attention — model now produces coherent output
+- `ParallelLMHead`, `cache_config` passthrough, `get_rope()`
+
+### 0.2.53
+- Self-managed KV cache for MHA layers (superseded by v0.2.54)
+
+### 0.2.52
+- Environment version logging on plugin startup
+
+### 0.2.51
+- Cleanup of debug logging from earlier versions
+
+### 0.2.50
+- Remove excessive checkpoint weight logging
+
+### 0.2.49
+- Fix weight loading edge cases for attention layer projections
+
+### 0.2.48
+- Improve A_log -> A conversion logging
+
+### 0.2.47
+- Fix repeat_kv expansion for grouped-head Mamba
+
+### 0.2.46
+- Cleanup debug prints from v0.2.39-0.2.40
+
+### 0.2.45
+- Fix conv1d weight shape handling for vLLM ops path
+
 ### 0.2.44
 - **CRITICAL FIX**: Proper state persistence in PyTorch fallback path
 - Previously, SSM state was reset to zero every forward call, causing output degeneration
