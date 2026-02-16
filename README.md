@@ -39,6 +39,12 @@ This package uses vLLM's plugin system (`vllm.general_plugins` entry point) to r
 
 ## Changelog
 
+### 0.2.60
+- **MAJOR FIX**: Rewrite decode path to match vLLM kernel conventions
+- `causal_conv1d_update` expects batch-first `(num_decode, d_inner)`, not dim-first
+- `selective_state_update` needs multi-head format: reshape state/x/dt/z to `(*, nheads, head_dim, ...)` so kernel's `nheads % ngroups == 0` assertion passes with grouped B/C
+- Preallocate `out` tensor for `selective_state_update` (required, returns None)
+
 ### 0.2.59
 - **FIX**: Conv state shape must be `(d_conv-1, conv_dim)` not `(conv_dim, d_conv-1)`
 - vLLM's `causal_conv1d_fn` asserts `stride_istate_dim == 1` (conv_dim must be contiguous)

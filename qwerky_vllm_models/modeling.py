@@ -505,10 +505,10 @@ if _MambaBase is not None and _CustomOp is not None:
 
                 state_indices_d = state_indices[:num_decode_tokens]
 
-                # Conv update (single token per request)
-                # Input: (conv_dim, num_decode_tokens)
+                # Conv update — batch-first: (num_decode, d_inner)
+                # causal_conv1d_update expects x=(batch, dim), NOT (dim, batch)
                 x_conv_d = causal_conv1d_update(
-                    x_d.transpose(0, 1),
+                    x_d,
                     conv_state,
                     conv_weight,
                     bias=self.conv1d.bias,
@@ -516,23 +516,45 @@ if _MambaBase is not None and _CustomOp is not None:
                     conv_state_indices=state_indices_d,
                 )
 
-                # SSM state update
+                # SSM state update — multi-head format for selective_state_update
+                # The kernel asserts nheads % ngroups == 0, so we reshape
+                # state/x/dt/z to (*, nheads, head_dim, ...) format.
                 # Double bias: dt already has bias from dt_proj, dt_bias adds it again
-                y_d = selective_state_update(
-                    ssm_state,
-                    x_conv_d,
-                    dt_d.transpose(0, 1),
-                    self.A,
-                    B_d,
-                    C_d,
-                    D=D,
-                    z=z_d.transpose(0, 1),
-                    dt_bias=self.dt_proj.bias.float(),
-                    dt_softplus=True,
-                    state_batch_indices=state_indices_d,
+                nheads = self.num_heads   # d_inner // d_state
+                head_dim = self.d_state
+
+                x_mh = x_conv_d.view(-1, nheads, head_dim)
+                dt_mh = dt_d.view(-1, nheads, head_dim)
+                z_mh = z_d.view(-1, nheads, head_dim)
+                A_mh = self.A.view(nheads, head_dim, self.d_state)
+                D_mh = D.view(nheads, head_dim)
+                dt_bias_mh = self.dt_proj.bias.float().view(nheads, head_dim)
+                ssm_state_mh = ssm_state.view(
+                    ssm_state.shape[0], nheads, head_dim, self.d_state
                 )
 
-                ssm_outputs.insert(0, y_d)  # decode comes first in output
+                scan_outputs_d = torch.empty_like(x_mh)
+                selective_state_update(
+                    ssm_state_mh,
+                    x_mh,
+                    dt_mh,
+                    A_mh,
+                    B_d,
+                    C_d,
+                    D=D_mh,
+                    z=z_mh,
+                    dt_bias=dt_bias_mh,
+                    dt_softplus=True,
+                    state_batch_indices=state_indices_d,
+                    out=scan_outputs_d,
+                )
+
+                # Reshape back to (d_inner, num_decode) for cat with prefill
+                scan_outputs_d = scan_outputs_d.reshape(
+                    -1, self.d_inner
+                ).transpose(0, 1)
+
+                ssm_outputs.insert(0, scan_outputs_d)  # decode comes first
 
             # Combine and project
             y_combined = (
