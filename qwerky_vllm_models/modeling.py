@@ -229,7 +229,7 @@ if _MambaBase is not None and _CustomOp is not None:
         """MambaInLlama Mamba mixer with vLLM V1 integration.
 
         Uses vLLM's custom op pattern for CUDA graph compatibility:
-        - forward() dispatches via torch.ops.vllm.mamba_mixer
+        - forward() dispatches via torch.ops.vllm.mambainllama_mixer
         - forward_cuda() contains the actual computation
         - Registered in static_forward_context for V1 state binding
 
@@ -367,13 +367,13 @@ if _MambaBase is not None and _CustomOp is not None:
         def forward(self, hidden_states: torch.Tensor, output: torch.Tensor):
             """Dispatch via custom op for CUDA graph compatibility.
 
-            The torch.ops.vllm.mamba_mixer custom op looks up this layer
-            by prefix in forward_context.no_compile_layers and calls
+            The torch.ops.vllm.mambainllama_mixer custom op looks up this
+            layer by prefix in forward_context.no_compile_layers and calls
             forward_cuda(). The torch compiler excludes this op from
             CUDA graphs, so Mamba runs in eager mode while everything
             else gets compiled.
             """
-            torch.ops.vllm.mamba_mixer(hidden_states, output, self.prefix)
+            torch.ops.vllm.mambainllama_mixer(hidden_states, output, self.prefix)
 
         def forward_native(self, hidden_states: torch.Tensor, output: torch.Tensor):
             """Empty stub — forward_cuda handles all computation."""
@@ -382,7 +382,7 @@ if _MambaBase is not None and _CustomOp is not None:
         def forward_cuda(self, hidden_states: torch.Tensor, output: torch.Tensor):
             """CUDA forward with V1 state management.
 
-            Called by torch.ops.vllm.mamba_mixer via forward_context lookup.
+            Called by torch.ops.vllm.mambainllama_mixer via forward_context lookup.
             Gets state from self.kv_cache (bound by vLLM V1 engine).
             Handles mixed prefill+decode batches (V1 sends decode first, then prefill).
             """
