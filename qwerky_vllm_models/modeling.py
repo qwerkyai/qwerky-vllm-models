@@ -96,6 +96,12 @@ try:
     from vllm.utils.torch_utils import direct_register_custom_op
 
     _vllm_available = True
+
+    # torch.compile support
+    try:
+        from vllm.compilation.decorators import support_torch_compile as _support_torch_compile
+    except ImportError:
+        _support_torch_compile = None
     logger.info("vLLM core components loaded successfully")
 except ImportError as e:
     logger.warning(f"vLLM not available: {e}")
@@ -329,6 +335,9 @@ if _MambaBase is not None and _CustomOp is not None:
             # kv_cache placeholder — V1 engine binds real tensors via MambaBase
             self.kv_cache = (torch.tensor([]), torch.tensor([]))
 
+            # Lazy precomputation flag — tensors computed on first forward_cuda
+            self._precomputed = False
+
         # =================================================================
         # MambaBase interface (required for V1 cache allocation)
         # =================================================================
@@ -360,6 +369,26 @@ if _MambaBase is not None and _CustomOp is not None:
         def mamba_type(self) -> str:
             """Return mamba type for vLLM backend selection."""
             return "mamba1"
+
+        # =================================================================
+        # Precomputation
+        # =================================================================
+
+        def _precompute_static_tensors(self):
+            """Pre-compute static tensor views on first forward call.
+
+            Called lazily because weights aren't loaded until after __init__.
+            """
+            self._conv_weight = self.conv1d.weight.view(self.conv_dim, self.d_conv)
+            self._D_float = self.D.float()
+            self._dt_bias_float = self.dt_proj.bias.float()
+            # Multi-head views for decode path
+            nheads = self.num_heads
+            head_dim = self.d_state
+            self._A_mh = self.A.view(nheads, head_dim, self.d_state)
+            self._D_mh = self._D_float.view(nheads, head_dim)
+            self._dt_bias_mh = self._dt_bias_float.view(nheads, head_dim)
+            self._precomputed = True
 
         # =================================================================
         # CustomOp forward methods
@@ -396,6 +425,9 @@ if _MambaBase is not None and _CustomOp is not None:
                 output[:num_tokens] = self.out_proj(hidden_states[..., :self.d_inner])
                 return
 
+            if not self._precomputed:
+                self._precompute_static_tensors()
+
             assert isinstance(attn_metadata, dict)
             layer_metadata = attn_metadata[self.prefix]
 
@@ -417,8 +449,12 @@ if _MambaBase is not None and _CustomOp is not None:
             has_decode = num_decode_tokens > 0
 
             # ===== PROJECTION =====
-            # Process all tokens (including CUDA graph padding) through in_proj
+            # in_proj must run on full padded batch (CUDA graphs)
             zxbcdt = self.in_proj(hidden_states)
+
+            # Slice BEFORE expensive ops — padding tokens are never used
+            zxbcdt = zxbcdt[:num_actual_tokens]
+
             z, x, B, C, dt = torch.split(
                 zxbcdt,
                 [self.d_inner, self.d_xb, self.d_xb, self.d_inner, self.dt_rank],
@@ -426,25 +462,22 @@ if _MambaBase is not None and _CustomOp is not None:
             )
 
             # Delta time projection WITH bias (model trained with double bias)
+            # Now only runs on actual tokens (not padding)
             dt = self.dt_proj(dt)
 
-            # Expand x via repeat_interleave if needed
+            # Expand x via expand (stride-0 view + one contiguous copy)
             if self.repeat_kv_before_conv:
-                x = rearrange(x, "t (g d) -> t g d", g=self.num_xb_head)
-                x = torch.repeat_interleave(x, self.repeat_group, dim=-2)
-                x = rearrange(x, "t g d -> t (g d)")
+                x = x.view(-1, self.num_xb_head, 1, self.d_state) \
+                     .expand(-1, -1, self.repeat_group, -1) \
+                     .reshape(-1, self.d_inner)
 
-            # Expand B via repeat_interleave
-            B = rearrange(B, "t (g d) -> t g d", d=self.d_state)
-            B = torch.repeat_interleave(B, self.repeat_group, dim=-2)
+            # Expand B via expand (stride-0 view + one contiguous copy)
+            B = B.view(-1, self.num_xb_head, 1, self.d_state) \
+                 .expand(-1, -1, self.repeat_group, -1) \
+                 .reshape(-1, self.num_heads, self.d_state)
 
             # C is already d_inner, just reshape
-            C = rearrange(C, "t (g d) -> t g d", d=self.d_state)
-
-            # Conv weight: (conv_dim, d_conv) from (conv_dim, 1, d_conv)
-            conv_weight = rearrange(self.conv1d.weight, "d 1 w -> d w")
-
-            D = self.D.float()
+            C = C.view(-1, self.num_heads, self.d_state)
 
             # ===== SPLIT AND PROCESS =====
             # In V1: decode tokens come first, then prefill tokens
@@ -466,7 +499,7 @@ if _MambaBase is not None and _CustomOp is not None:
                 # Input: (conv_dim, num_prefill_tokens)
                 x_conv_p = causal_conv1d_fn(
                     x_p.transpose(0, 1),
-                    conv_weight,
+                    self._conv_weight,
                     self.conv1d.bias,
                     conv_state,
                     query_start_loc_p,
@@ -482,11 +515,11 @@ if _MambaBase is not None and _CustomOp is not None:
                     ssm_state,
                     dt_p.transpose(0, 1),
                     self.A,
-                    rearrange(B_p, "t h d -> h d t"),
-                    rearrange(C_p, "t h d -> h d t"),
-                    D=D,
+                    B_p.permute(1, 2, 0),
+                    C_p.permute(1, 2, 0),
+                    D=self._D_float,
                     z=z_p.transpose(0, 1),
-                    delta_bias=self.dt_proj.bias.float(),
+                    delta_bias=self._dt_bias_float,
                     delta_softplus=True,
                     query_start_loc=query_start_loc_p,
                     cache_indices=state_indices_p,
@@ -510,7 +543,7 @@ if _MambaBase is not None and _CustomOp is not None:
                 x_conv_d = causal_conv1d_update(
                     x_d,
                     conv_state,
-                    conv_weight,
+                    self._conv_weight,
                     bias=self.conv1d.bias,
                     activation="silu",
                     conv_state_indices=state_indices_d,
@@ -526,9 +559,6 @@ if _MambaBase is not None and _CustomOp is not None:
                 x_mh = x_conv_d.view(-1, nheads, head_dim)
                 dt_mh = dt_d.view(-1, nheads, head_dim)
                 z_mh = z_d.view(-1, nheads, head_dim)
-                A_mh = self.A.view(nheads, head_dim, self.d_state)
-                D_mh = D.view(nheads, head_dim)
-                dt_bias_mh = self.dt_proj.bias.float().view(nheads, head_dim)
                 ssm_state_mh = ssm_state.view(
                     ssm_state.shape[0], nheads, head_dim, self.d_state
                 )
@@ -538,12 +568,12 @@ if _MambaBase is not None and _CustomOp is not None:
                     ssm_state_mh,
                     x_mh,
                     dt_mh,
-                    A_mh,
+                    self._A_mh,
                     B_d,
                     C_d,
-                    D=D_mh,
+                    D=self._D_mh,
                     z=z_mh,
-                    dt_bias=dt_bias_mh,
+                    dt_bias=self._dt_bias_mh,
                     dt_softplus=True,
                     state_batch_indices=state_indices_d,
                     out=scan_outputs_d,
@@ -710,17 +740,21 @@ if _vllm_available:
 # =============================================================================
 
 class MLP(nn.Module):
-    """MLP layer with SiLU activation."""
+    """MLP layer with fused gate+up projection and SiluAndMul activation."""
 
     def __init__(self, d_model: int, intermediate_size: int, hidden_act: str = "silu"):
         super().__init__()
-        self.gate_proj = nn.Linear(d_model, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(d_model, intermediate_size, bias=False)
+        self.intermediate_size = intermediate_size
+        # Merged gate+up into single matmul: [d_model] -> [2*intermediate_size]
+        self.gate_up_proj = nn.Linear(d_model, 2 * intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, d_model, bias=False)
-        self.act_fn = nn.SiLU() if hidden_act == "silu" else nn.GELU()
+        if hidden_act == "silu" and _vllm_available:
+            self.act_fn = SiluAndMul()
+        else:
+            self.act_fn = nn.SiLU() if hidden_act == "silu" else nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(self.act_fn(self.gate_up_proj(x)))
 
 
 # =============================================================================
@@ -773,14 +807,13 @@ class MHADecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> torch.Tensor:
-        # hidden_states: [num_tokens, hidden_size] (2D, vLLM V1 format)
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+    def forward(self, hidden_states, residual=None, positions=None, **kwargs):
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual)
 
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
@@ -788,18 +821,14 @@ class MHADecoderLayer(nn.Module):
 
         q, k = self.rotary_emb(positions, q, k)
 
-        # vLLM Attention handles KV cache, paging, GQA, masking internally
         attn_output = self.attn(q, k, v)
-
         hidden_states = self.o_proj(attn_output)
-        hidden_states = residual + hidden_states
 
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
 
-        return hidden_states
+        return hidden_states, residual
 
 
 # =============================================================================
@@ -825,25 +854,22 @@ class MambaDecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(config.d_model, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.d_model, eps=config.rms_norm_eps)
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        **kwargs,
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+    def forward(self, hidden_states, residual=None, **kwargs):
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual)
 
-        # Output tensor pattern for custom op compatibility
         output = torch.empty_like(hidden_states)
         self.mamba(hidden_states, output)
-        hidden_states = residual + output
 
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(
+            output, residual)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
 
-        return hidden_states
+        return hidden_states, residual
 
 
 # =============================================================================
@@ -853,12 +879,27 @@ class MambaDecoderLayer(nn.Module):
 class MambaInLlamaMambaModel(nn.Module):
     """MambaInLlama Model backbone."""
 
-    def __init__(self, config: MambaInLlamaMambaConfig, prefix: str = "",
-                 cache_config: "CacheConfig" = None, model_config: "ModelConfig" = None):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "",
+                 config: MambaInLlamaMambaConfig):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
         self.prefix = prefix
+
+        # Register our custom op as a splitting op for torch.compile.
+        # Without this, the inductor includes the op in the compiled graph
+        # where the fake_impl (no-op) runs instead of forward_cuda, producing
+        # garbage output. With this, the graph is partitioned at our op and
+        # it runs in eager mode (like vllm::mamba_mixer does for Jamba).
+        compilation_config = vllm_config.compilation_config
+        op_name = "vllm::mambainllama_mixer"
+        if (compilation_config.splitting_ops is not None
+                and op_name not in compilation_config.splitting_ops):
+            compilation_config.splitting_ops.append(op_name)
+
+        cache_config = vllm_config.cache_config
+        model_config = vllm_config.model_config
+
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
 
         self.layers = nn.ModuleList()
@@ -886,26 +927,23 @@ class MambaInLlamaMambaModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        attn_metadata=None,
+        intermediate_tensors: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Forward pass with vLLM state management.
-
-        Args:
-            input_ids: Input token IDs [num_tokens] or [batch, seq]
-            positions: Position indices for RoPE [num_tokens]
-            attn_metadata: vLLM attention metadata for Mamba state indices
-        """
         hidden_states = self.embed_input_ids(input_ids)
+        residual = None
 
-        for i, layer in enumerate(self.layers):
-            if isinstance(layer, MambaDecoderLayer):
-                hidden_states = layer(hidden_states)
-            else:
-                # MHA layer — vLLM Attention handles KV cache internally
-                hidden_states = layer(hidden_states, positions)
+        for layer in self.layers:
+            hidden_states, residual = layer(
+                hidden_states, residual=residual, positions=positions,
+            )
 
-        hidden_states = self.norm(hidden_states)
+        hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
+
+
+if _vllm_available and _support_torch_compile is not None:
+    MambaInLlamaMambaModel = _support_torch_compile(MambaInLlamaMambaModel)
 
 
 # =============================================================================
@@ -1042,20 +1080,10 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
         self.vocab_size = config.vocab_size
         self.prefix = prefix
 
-        # Extract cache_config and model_config from vllm_config
-        cache_config = None
-        vllm_model_config = None
-        if vllm_config is not None:
-            if hasattr(vllm_config, 'cache_config'):
-                cache_config = vllm_config.cache_config
-            if hasattr(vllm_config, 'model_config'):
-                vllm_model_config = vllm_config.model_config
-
-        # Pass prefix, cache_config, and model_config to model backbone
+        # Pass vllm_config to model backbone (decorator handles vllm_config/prefix)
         model_prefix = f"{prefix}.model" if prefix else "model"
         self.model = MambaInLlamaMambaModel(
-            config, prefix=model_prefix,
-            cache_config=cache_config, model_config=vllm_model_config,
+            vllm_config=vllm_config, prefix=model_prefix, config=config,
         )
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, bias=False)
 
@@ -1079,25 +1107,15 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
 
     def forward(
         self,
-        input_ids: torch.Tensor = None,
-        positions: torch.Tensor = None,
-        kv_caches: list = None,
-        attn_metadata=None,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
-        intermediate_tensors=None,
         **kwargs,
     ) -> torch.Tensor:
-        """vLLM-style forward pass.
-
-        With vLLM V1:
-        - Mamba layers get state from self.kv_cache (bound by vLLM via MambaBase)
-        - Attention layers get KV cache from vLLM Attention class (via forward context)
-        - Positions and attn_metadata come from vLLM model runner
-        """
         hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
-            attn_metadata=attn_metadata,
         )
 
         return hidden_states
@@ -1206,6 +1224,22 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
                     else:
                         skipped_weights.append(f"{name} -> {new_name} (shape mismatch: {converted.shape} vs {param.shape})")
                         continue
+
+            # Handle merged gate_up_proj: checkpoint gate_proj/up_proj -> model gate_up_proj
+            if ".mlp.gate_proj.weight" in name:
+                merged_name = name.replace(".mlp.gate_proj.weight", ".mlp.gate_up_proj.weight")
+                if merged_name in params_dict:
+                    intermediate_size = loaded_weight.shape[0]
+                    params_dict[merged_name].data[:intermediate_size, :].copy_(loaded_weight)
+                    loaded_params.add(merged_name)
+                    continue
+            if ".mlp.up_proj.weight" in name:
+                merged_name = name.replace(".mlp.up_proj.weight", ".mlp.gate_up_proj.weight")
+                if merged_name in params_dict:
+                    intermediate_size = loaded_weight.shape[0]
+                    params_dict[merged_name].data[intermediate_size:, :].copy_(loaded_weight)
+                    loaded_params.add(merged_name)
+                    continue
 
             # Try direct match
             if name in params_dict:
