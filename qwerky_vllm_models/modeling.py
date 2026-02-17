@@ -471,7 +471,8 @@ if _MambaBase is not None and _CustomOp is not None:
                 self.cache_config is not None
                 and self.cache_config.enable_prefix_caching
             )
-            if prefix_caching_enabled:
+            if (prefix_caching_enabled
+                    and layer_metadata.block_idx_last_computed_token is not None):
                 block_idx_last_computed_token_d, block_idx_last_computed_token_p = (
                     torch.split(
                         layer_metadata.block_idx_last_computed_token,
@@ -604,7 +605,7 @@ if _MambaBase is not None and _CustomOp is not None:
                 state_indices_d = state_indices[:num_decode_tokens]
 
                 # Prefix caching: separate read/write state indices
-                if prefix_caching_enabled:
+                if block_idx_last_computed_token_d is not None:
                     state_indices_d_input = state_indices_d.gather(
                         1, block_idx_last_computed_token_d.unsqueeze(1)
                     ).squeeze(1)
