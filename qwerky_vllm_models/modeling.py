@@ -79,6 +79,7 @@ try:
     from vllm.model_executor.layers.linear import (
         ColumnParallelLinear,
         MergedColumnParallelLinear,
+        QKVParallelLinear,
         RowParallelLinear,
     )
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -278,10 +279,11 @@ if _MambaBase is not None and _CustomOp is not None:
 
             # Fused input projection: [z, x, B, C, dt]
             # z: d_inner, x: d_xb, B: d_xb, C: d_inner, dt: dt_rank
-            self.in_proj = nn.Linear(
+            self.in_proj = ColumnParallelLinear(
                 self.d_model,
                 2 * self.d_inner + 2 * self.d_xb + self.dt_rank,
                 bias=False,
+                prefix=f"{prefix}.in_proj",
             )
 
             # Conv1d - depthwise convolution
@@ -321,7 +323,10 @@ if _MambaBase is not None and _CustomOp is not None:
             self.D._no_weight_decay = True
 
             # Output projection
-            self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=False)
+            self.out_proj = RowParallelLinear(
+                self.d_inner, self.d_model, bias=False,
+                prefix=f"{prefix}.out_proj",
+            )
 
             self.activation = "silu"
 
@@ -422,7 +427,8 @@ if _MambaBase is not None and _CustomOp is not None:
             if attn_metadata is None:
                 # V1 profile run — write dummy output
                 num_tokens = hidden_states.shape[0]
-                output[:num_tokens] = self.out_proj(hidden_states[..., :self.d_inner])
+                out, _ = self.out_proj(hidden_states[..., :self.d_inner])
+                output[:num_tokens] = out
                 return
 
             if not self._precomputed:
@@ -450,7 +456,7 @@ if _MambaBase is not None and _CustomOp is not None:
 
             # ===== PROJECTION =====
             # in_proj must run on full padded batch (CUDA graphs)
-            zxbcdt = self.in_proj(hidden_states)
+            zxbcdt, _ = self.in_proj(hidden_states)
 
             # Slice BEFORE expensive ops — padding tokens are never used
             zxbcdt = zxbcdt[:num_actual_tokens]
@@ -591,7 +597,7 @@ if _MambaBase is not None and _CustomOp is not None:
                 ssm_outputs[0] if len(ssm_outputs) == 1
                 else torch.cat(ssm_outputs, dim=-1)
             )
-            out = self.out_proj(y_combined.transpose(0, 1))
+            out, _ = self.out_proj(y_combined.transpose(0, 1))
             output[:num_actual_tokens] = out
 
 else:
@@ -742,19 +748,28 @@ if _vllm_available:
 class MLP(nn.Module):
     """MLP layer with fused gate+up projection and SiluAndMul activation."""
 
-    def __init__(self, d_model: int, intermediate_size: int, hidden_act: str = "silu"):
+    def __init__(self, d_model: int, intermediate_size: int,
+                 hidden_act: str = "silu", prefix: str = ""):
         super().__init__()
         self.intermediate_size = intermediate_size
-        # Merged gate+up into single matmul: [d_model] -> [2*intermediate_size]
-        self.gate_up_proj = nn.Linear(d_model, 2 * intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, d_model, bias=False)
+        self.gate_up_proj = MergedColumnParallelLinear(
+            d_model, [intermediate_size, intermediate_size],
+            bias=False, prefix=f"{prefix}.gate_up_proj",
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size, d_model, bias=False,
+            prefix=f"{prefix}.down_proj",
+        )
         if hidden_act == "silu" and _vllm_available:
             self.act_fn = SiluAndMul()
         else:
             self.act_fn = nn.SiLU() if hidden_act == "silu" else nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.gate_up_proj(x)))
+        x, _ = self.gate_up_proj(x)
+        x = self.act_fn(x)
+        x, _ = self.down_proj(x)
+        return x
 
 
 # =============================================================================
@@ -781,16 +796,24 @@ class MHADecoderLayer(nn.Module):
         self.scaling = self.head_dim ** -0.5
         self.max_position_embeddings = getattr(config, 'max_position_embeddings', 8192)
 
-        self.q_proj = nn.Linear(self.hidden_size, self.q_size, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.kv_size, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.kv_size, bias=False)
-        self.o_proj = nn.Linear(self.q_size, self.hidden_size, bias=False)
+        self.qkv_proj = QKVParallelLinear(
+            self.hidden_size, self.head_dim, self.num_heads,
+            self.num_kv_heads, bias=False, prefix=f"{prefix}.qkv_proj",
+        )
+        self.o_proj = RowParallelLinear(
+            self.q_size, self.hidden_size, bias=False,
+            prefix=f"{prefix}.o_proj",
+        )
 
-        # vLLM RoPE
+        # vLLM RoPE — build rope_parameters from config's rope_scaling + rope_theta
+        rope_params = dict(getattr(config, 'rope_scaling', None) or {})
+        rope_params["rope_theta"] = getattr(config, 'rope_theta', 10000.0)
+        if "rope_type" not in rope_params:
+            rope_params["rope_type"] = "default"
         self.rotary_emb = get_rope(
             self.head_dim,
             max_position=self.max_position_embeddings,
-            rope_parameters=getattr(config, 'rope_parameters', None),
+            rope_parameters=rope_params,
         )
 
         # vLLM Attention — handles KV cache, paging, GQA, masking
@@ -803,7 +826,8 @@ class MHADecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
-        self.mlp = MLP(config.hidden_size, config.intermediate_size, config.hidden_act)
+        self.mlp = MLP(config.hidden_size, config.intermediate_size, config.hidden_act,
+                       prefix=f"{prefix}.mlp")
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -815,14 +839,13 @@ class MHADecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
 
-        q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v)
-        hidden_states = self.o_proj(attn_output)
+        hidden_states, _ = self.o_proj(attn_output)
 
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
@@ -850,7 +873,8 @@ class MambaDecoderLayer(nn.Module):
             config, layer_idx, prefix=mamba_prefix,
             model_config=model_config, cache_config=cache_config,
         )
-        self.mlp = MLP(config.d_model, config.intermediate_size, config.hidden_act)
+        self.mlp = MLP(config.d_model, config.intermediate_size, config.hidden_act,
+                       prefix=f"{prefix}.mlp")
         self.input_layernorm = RMSNorm(config.d_model, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.d_model, eps=config.rms_norm_eps)
 
@@ -997,6 +1021,8 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
                     intermediate_size=intermediate_size,
                     rms_norm_eps=getattr(hf_cfg, "rms_norm_eps", 1e-6),
                     rope_theta=getattr(hf_cfg, "rope_theta", 10000.0),
+                    max_position_embeddings=getattr(hf_cfg, "max_position_embeddings", 2048),
+                    rope_scaling=getattr(hf_cfg, "rope_scaling", None),
                 )
 
                 # Try to load mamba_config.json for Mamba-specific settings
@@ -1140,137 +1166,116 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
         """Load weights from checkpoint.
 
         Handles weight name transformations:
-        1. mha.in_proj.weight -> split into q_proj, k_proj, v_proj
-        2. mha.out_proj.weight -> rename to o_proj.weight
+        1. mha.in_proj.weight -> split into q/k/v, load via qkv_proj weight_loader
+        2. mha.out_proj -> rename to o_proj
+        3. mlp.gate_proj/up_proj -> merge into gate_up_proj via weight_loader
+        4. A_log -> A conversion
+        5. All parallel linear params use weight_loader for TP support
         """
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         skipped_weights = []
 
-        # Log model parameter names for debugging (first 10)
         param_names = list(params_dict.keys())
         logger.info(f"Model has {len(param_names)} parameters")
         logger.info(f"First 20 model params: {param_names[:20]}")
 
-        # Get dimensions for attention splitting
-        # Q: num_heads * head_dim, K/V: num_kv_heads * head_dim
+        # Attention QKV dimensions for splitting fused checkpoint weight
         num_heads = self.config.num_attention_heads
         num_kv_heads = self.config.num_key_value_heads or num_heads
         head_dim = self.config.hidden_size // num_heads
-        q_dim = num_heads * head_dim  # 4096 for 32 heads * 128 dim
-        kv_dim = num_kv_heads * head_dim  # 1024 for 8 heads * 128 dim
+        q_dim = num_heads * head_dim
+        kv_dim = num_kv_heads * head_dim
 
         logger.info(f"Attention dims: q_dim={q_dim}, kv_dim={kv_dim}, head_dim={head_dim}")
+
+        # Stacked params: checkpoint name → model name + shard_id
+        # (param_name, weight_name, shard_id)
+        stacked_params_mapping = [
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
+        ]
 
         checkpoint_names = []
         for name, loaded_weight in weights:
             checkpoint_names.append(name)
-            # Log first 20 checkpoint weight names
             if len(checkpoint_names) <= 20:
                 logger.info(f"Checkpoint weight: {name} shape={loaded_weight.shape}")
 
-            # Handle fused attention in_proj -> split into q, k, v
+            # --- Fused QKV: split and load via weight_loader ---
             if ".mha.in_proj.weight" in name:
-                # Split fused QKV weight: [q_dim + kv_dim + kv_dim, hidden]
                 base_name = name.replace(".mha.in_proj.weight", "")
-
-                q_weight = loaded_weight[:q_dim, :]
-                k_weight = loaded_weight[q_dim:q_dim + kv_dim, :]
-                v_weight = loaded_weight[q_dim + kv_dim:, :]
-
-                found_any = False
-                for suffix, weight in [(".q_proj.weight", q_weight),
-                                       (".k_proj.weight", k_weight),
-                                       (".v_proj.weight", v_weight)]:
-                    param_name = base_name + suffix
-                    if param_name in params_dict:
-                        params_dict[param_name].data.copy_(weight)
-                        loaded_params.add(param_name)
-                        found_any = True
-                    else:
-                        skipped_weights.append(f"{name} -> {param_name} (param not found - is attn_layers configured?)")
-                if not found_any:
-                    logger.warning(f"Attention layer weights {name} found but no q/k/v params exist. Check attn_layers config!")
+                qkv_name = base_name + ".qkv_proj.weight"
+                if qkv_name in params_dict:
+                    param = params_dict[qkv_name]
+                    q_weight = loaded_weight[:q_dim, :]
+                    k_weight = loaded_weight[q_dim:q_dim + kv_dim, :]
+                    v_weight = loaded_weight[q_dim + kv_dim:, :]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, q_weight, "q")
+                    weight_loader(param, k_weight, "k")
+                    weight_loader(param, v_weight, "v")
+                    loaded_params.add(qkv_name)
+                else:
+                    skipped_weights.append(f"{name} -> {qkv_name} (param not found - is attn_layers configured?)")
                 continue
 
-            # Handle attention out_proj rename
-            if ".mha.out_proj.weight" in name:
+            # --- Attention out_proj rename ---
+            if ".mha.out_proj." in name:
                 new_name = name.replace(".mha.out_proj.", ".o_proj.")
                 if new_name in params_dict:
-                    params_dict[new_name].data.copy_(loaded_weight)
+                    param = params_dict[new_name]
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
+                    weight_loader(param, loaded_weight)
                     loaded_params.add(new_name)
                 continue
 
-            # Handle attention out_proj bias if present
-            if ".mha.out_proj.bias" in name:
-                new_name = name.replace(".mha.out_proj.", ".o_proj.")
-                if new_name in params_dict:
-                    params_dict[new_name].data.copy_(loaded_weight)
-                    loaded_params.add(new_name)
-                continue
-
-            # Handle A_log -> A conversion for Mamba layers
-            # Checkpoint stores A_log, we need A = -exp(A_log) as per Mamba paper
+            # --- A_log -> A conversion ---
             if ".mamba.A_log" in name:
                 new_name = name.replace(".mamba.A_log", ".mamba.A")
                 if new_name in params_dict:
                     param = params_dict[new_name]
-                    # A = -exp(A_log) as per Mamba paper
                     converted = -torch.exp(loaded_weight)
                     if param.shape == converted.shape:
                         param.data.copy_(converted)
                         loaded_params.add(new_name)
-                        continue
                     else:
                         skipped_weights.append(f"{name} -> {new_name} (shape mismatch: {converted.shape} vs {param.shape})")
-                        continue
+                continue
 
-            # Handle merged gate_up_proj: checkpoint gate_proj/up_proj -> model gate_up_proj
-            if ".mlp.gate_proj.weight" in name:
-                merged_name = name.replace(".mlp.gate_proj.weight", ".mlp.gate_up_proj.weight")
-                if merged_name in params_dict:
-                    intermediate_size = loaded_weight.shape[0]
-                    params_dict[merged_name].data[:intermediate_size, :].copy_(loaded_weight)
-                    loaded_params.add(merged_name)
+            # --- Stacked params (MLP gate_proj/up_proj -> gate_up_proj) ---
+            is_stacked = False
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
                     continue
-            if ".mlp.up_proj.weight" in name:
-                merged_name = name.replace(".mlp.up_proj.weight", ".mlp.gate_up_proj.weight")
-                if merged_name in params_dict:
-                    intermediate_size = loaded_weight.shape[0]
-                    params_dict[merged_name].data[intermediate_size:, :].copy_(loaded_weight)
-                    loaded_params.add(merged_name)
-                    continue
+                stacked_name = name.replace(weight_name, param_name)
+                if stacked_name in params_dict:
+                    param = params_dict[stacked_name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
+                    loaded_params.add(stacked_name)
+                is_stacked = True
+                break
+            if is_stacked:
+                continue
 
-            # Try direct match
-            if name in params_dict:
-                param = params_dict[name]
-                if param.shape == loaded_weight.shape:
-                    param.data.copy_(loaded_weight)
-                    loaded_params.add(name)
-                    continue
+            # --- Default: direct match with weight_loader ---
+            param_name = name
+            if param_name not in params_dict:
+                # Try with/without model prefix
+                if name.startswith("model."):
+                    param_name = name[6:]
+                else:
+                    param_name = f"model.{name}"
 
-            # Try with/without model prefix
-            candidates = [name]
-            if name.startswith("model."):
-                candidates.append(name[6:])
+            if param_name in params_dict:
+                param = params_dict[param_name]
+                weight_loader = getattr(param, "weight_loader",
+                                        default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(param_name)
             else:
-                candidates.append(f"model.{name}")
-
-            matched = False
-            for candidate in candidates:
-                if candidate in params_dict:
-                    param = params_dict[candidate]
-                    if param.shape == loaded_weight.shape:
-                        param.data.copy_(loaded_weight)
-                        loaded_params.add(candidate)
-                        matched = True
-                        break
-                    else:
-                        skipped_weights.append(f"{name} (shape mismatch: checkpoint {loaded_weight.shape} vs model {param.shape})")
-                        matched = True  # Don't add to skipped again
-                        break
-
-            if not matched:
                 skipped_weights.append(f"{name} (no matching param)")
 
         logger.info(f"Loaded {len(loaded_params)}/{len(params_dict)} parameters from {len(checkpoint_names)} checkpoint weights")
@@ -1279,15 +1284,12 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
             for w in skipped_weights[:20]:
                 logger.info(f"  - {w}")
 
-        # Log model params that weren't loaded (helps diagnose attn_layers issues)
         if len(loaded_params) < len(params_dict):
             missing_params = len(params_dict) - len(loaded_params)
             logger.warning(f"{missing_params} model parameters may not have been loaded from checkpoint!")
             logger.info(f"Config attn_layers: {self.config.attn_layers}")
-            # Show some attention-related params to help debug
-            attn_params = [p for p in param_names if 'q_proj' in p or 'k_proj' in p or 'v_proj' in p or 'o_proj' in p]
-            if attn_params:
-                logger.info(f"Model has {len(attn_params)} attention params: {attn_params[:8]}...")
+            unloaded = set(param_names) - loaded_params
+            logger.info(f"Unloaded params: {sorted(unloaded)[:20]}")
 
         return loaded_params
 
