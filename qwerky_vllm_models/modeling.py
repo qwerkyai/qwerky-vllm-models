@@ -79,6 +79,7 @@ try:
     from vllm.model_executor.layers.linear import (
         ColumnParallelLinear,
         MergedColumnParallelLinear,
+        QKVParallelLinear,
         RowParallelLinear,
     )
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -166,9 +167,13 @@ except ImportError:
 # Try to import protocol interfaces for model registration
 _HasInnerState = None
 _IsHybrid = None
+_SupportsMambaPrefixCaching = None
 try:
     from vllm.model_executor.models.interfaces import HasInnerState as _HasInnerState
     from vllm.model_executor.models.interfaces import IsHybrid as _IsHybrid
+    from vllm.model_executor.models.interfaces import (
+        SupportsMambaPrefixCaching as _SupportsMambaPrefixCaching,
+    )
 except ImportError:
     pass
 
@@ -180,6 +185,13 @@ try:
         MambaStateShapeCalculator as _vllm_MambaStateShapeCalculator,
         MambaStateDtypeCalculator as _vllm_MambaStateDtypeCalculator,
     )
+except ImportError:
+    pass
+
+# support_torch_compile for torch.compile integration
+_support_torch_compile = None
+try:
+    from vllm.compilation.decorators import support_torch_compile as _support_torch_compile
 except ImportError:
     pass
 
@@ -368,6 +380,25 @@ if _MambaBase is not None and _CustomOp is not None:
             # kv_cache placeholder — V1 engine binds real tensors via MambaBase
             self.kv_cache = (torch.tensor([]), torch.tensor([]))
 
+            # Precomputed static tensors (lazily initialized on first forward)
+            self._precomputed = False
+
+        # =================================================================
+        # Precomputed static tensors (avoid per-forward recomputation)
+        # =================================================================
+
+        def _precompute_static_tensors(self):
+            """Precompute static tensor views/conversions once after weight loading."""
+            self._conv_weight = self.conv1d.weight.reshape(self.conv_dim_local, self.d_conv)
+            self._D_float = self.D.float()
+            self._dt_bias_float = self.dt_proj.bias.float()
+            nheads = self.num_heads_local
+            head_dim = self.d_state
+            self._A_mh = self.A.view(nheads, head_dim, self.d_state)
+            self._D_mh = self._D_float.view(nheads, head_dim)
+            self._dt_bias_mh = self._dt_bias_float.view(nheads, head_dim)
+            self._precomputed = True
+
         # =================================================================
         # MambaBase interface (required for V1 cache allocation)
         # =================================================================
@@ -393,16 +424,34 @@ if _MambaBase is not None and _CustomOp is not None:
             return (conv_state_shape, ssm_state_shape)
 
         def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
-            """Return state dtypes for vLLM cache allocation."""
+            """Return state dtypes for vLLM cache allocation.
+
+            SSM state defaults to float32 because Mamba's recurrent nature
+            compounds bfloat16 rounding errors across tokens. Conv state
+            can remain at model dtype (just a sliding window, no accumulation).
+            Users can override via --mamba-ssm-cache-dtype.
+            """
             if (self.model_config is not None and self.cache_config is not None
                     and _vllm_MambaStateDtypeCalculator is not None):
-                return _vllm_MambaStateDtypeCalculator.mamba1_state_dtype(
-                    self.model_config.dtype,
-                    self.cache_config.mamba_cache_dtype,
-                    self.cache_config.mamba_ssm_cache_dtype,
+                # If user explicitly set mamba_ssm_cache_dtype, honor it.
+                # Otherwise, default SSM state to float32 for accuracy.
+                if self.cache_config.mamba_ssm_cache_dtype != "auto":
+                    return _vllm_MambaStateDtypeCalculator.mamba1_state_dtype(
+                        self.model_config.dtype,
+                        self.cache_config.mamba_cache_dtype,
+                        self.cache_config.mamba_ssm_cache_dtype,
+                    )
+                # Auto mode: conv state at model dtype, SSM state at float32
+                from vllm.model_executor.layers.mamba.mamba_utils import (
+                    get_kv_cache_torch_dtype,
                 )
+                conv_dtype = get_kv_cache_torch_dtype(
+                    self.cache_config.mamba_cache_dtype,
+                    self.model_config.dtype,
+                )
+                return (conv_dtype, torch.float32)
             dtype = self.out_proj.weight.dtype
-            return (dtype, dtype)
+            return (dtype, torch.float32)
 
         @property
         def mamba_type(self) -> str:
@@ -439,12 +488,18 @@ if _MambaBase is not None and _CustomOp is not None:
             attn_metadata = forward_context.attn_metadata
 
             if attn_metadata is None:
-                # V1 profile run — write dummy output
+                # V1 profile run — write dummy output (don't precompute yet,
+                # weights may not be loaded during early profiling)
                 num_tokens = hidden_states.shape[0]
                 output[:num_tokens] = self.out_proj(
                     hidden_states[..., :self.d_inner_local]
                 )[0]
                 return
+
+            # Lazily precompute static tensors (after profile check —
+            # weights are guaranteed loaded by the time real forward runs)
+            if not self._precomputed:
+                self._precompute_static_tensors()
 
             assert isinstance(attn_metadata, dict)
             layer_metadata = attn_metadata[self.prefix]
@@ -507,6 +562,10 @@ if _MambaBase is not None and _CustomOp is not None:
             if self.is_lora_enabled or current_platform.is_rocm():
                 hidden_states = hidden_states.contiguous()
             zxbcdt = self.in_proj(hidden_states)[0]
+
+            # Early slice to actual tokens — skip padding before expensive ops
+            zxbcdt = zxbcdt[:num_actual_tokens]
+
             z, x, B, C, dt = torch.split(
                 zxbcdt,
                 [self.d_inner_local, self.d_xb_local, self.d_xb_local,
@@ -518,23 +577,19 @@ if _MambaBase is not None and _CustomOp is not None:
             # ColumnParallelLinear returns (output, bias) tuple
             dt = self.dt_proj(dt)[0]
 
-            # Expand x via repeat_interleave if needed
+            # Expand x via expand (zero-copy stride-0 view + one reshape)
             if self.repeat_kv_before_conv:
-                x = rearrange(x, "t (g d) -> t g d", g=self.num_xb_head_local)
-                x = torch.repeat_interleave(x, self.repeat_group, dim=-2)
-                x = rearrange(x, "t g d -> t (g d)")
+                x = x.view(-1, self.num_xb_head_local, 1, self.d_state) \
+                     .expand(-1, -1, self.repeat_group, -1) \
+                     .reshape(-1, self.d_inner_local)
 
-            # Expand B via repeat_interleave
-            B = rearrange(B, "t (g d) -> t g d", d=self.d_state)
-            B = torch.repeat_interleave(B, self.repeat_group, dim=-2)
+            # Expand B via expand (zero-copy stride-0 view + one reshape)
+            B = B.view(-1, self.num_xb_head_local, 1, self.d_state) \
+                 .expand(-1, -1, self.repeat_group, -1) \
+                 .reshape(-1, self.num_heads_local, self.d_state)
 
-            # C is already d_inner_local, just reshape
-            C = rearrange(C, "t (g d) -> t g d", d=self.d_state)
-
-            # Conv weight: (conv_dim_local, d_conv) from (conv_dim_local, 1, d_conv)
-            conv_weight = rearrange(self.conv1d.weight, "d 1 w -> d w")
-
-            D = self.D.float()
+            # C is already d_inner_local, just reshape (direct view)
+            C = C.view(-1, self.num_heads_local, self.d_state)
 
             # ===== SPLIT AND PROCESS =====
             # In V1: decode tokens come first, then prefill tokens
@@ -556,7 +611,7 @@ if _MambaBase is not None and _CustomOp is not None:
                 # Input: (conv_dim, num_prefill_tokens)
                 x_conv_p = causal_conv1d_fn(
                     x_p.transpose(0, 1),
-                    conv_weight,
+                    self._conv_weight,
                     self.conv1d.bias,
                     conv_state,
                     query_start_loc_p,
@@ -577,11 +632,11 @@ if _MambaBase is not None and _CustomOp is not None:
                     ssm_state,
                     dt_p.transpose(0, 1),
                     self.A,
-                    rearrange(B_p, "t h d -> h d t"),
-                    rearrange(C_p, "t h d -> h d t"),
-                    D=D,
+                    B_p.permute(1, 2, 0),
+                    C_p.permute(1, 2, 0),
+                    D=self._D_float,
                     z=z_p.transpose(0, 1),
-                    delta_bias=self.dt_proj.bias.float(),
+                    delta_bias=self._dt_bias_float,
                     delta_softplus=True,
                     query_start_loc=query_start_loc_p,
                     cache_indices=state_indices_p,
@@ -621,7 +676,7 @@ if _MambaBase is not None and _CustomOp is not None:
                 x_conv_d = causal_conv1d_update(
                     x_d,
                     conv_state,
-                    conv_weight,
+                    self._conv_weight,
                     bias=self.conv1d.bias,
                     activation="silu",
                     conv_state_indices=state_indices_d,
@@ -639,9 +694,6 @@ if _MambaBase is not None and _CustomOp is not None:
                 x_mh = x_conv_d.view(-1, nheads, head_dim)
                 dt_mh = dt_d.view(-1, nheads, head_dim)
                 z_mh = z_d.view(-1, nheads, head_dim)
-                A_mh = self.A.view(nheads, head_dim, self.d_state)
-                D_mh = D.view(nheads, head_dim)
-                dt_bias_mh = self.dt_proj.bias.float().view(nheads, head_dim)
                 ssm_state_mh = ssm_state.view(
                     ssm_state.shape[0], nheads, head_dim, self.d_state
                 )
@@ -651,12 +703,12 @@ if _MambaBase is not None and _CustomOp is not None:
                     ssm_state_mh,
                     x_mh,
                     dt_mh,
-                    A_mh,
+                    self._A_mh,
                     B_d,
                     C_d,
-                    D=D_mh,
+                    D=self._D_mh,
                     z=z_mh,
-                    dt_bias=dt_bias_mh,
+                    dt_bias=self._dt_bias_mh,
                     dt_softplus=True,
                     state_batch_indices=state_indices_d_input,
                     dst_state_batch_indices=state_indices_d_output,
@@ -755,7 +807,7 @@ else:
 
         def get_state_dtype(self):
             dtype = self.out_proj.weight.dtype
-            return (dtype, dtype)
+            return (dtype, torch.float32)
 
         @property
         def mamba_type(self):
@@ -831,16 +883,39 @@ if _vllm_available:
 # =============================================================================
 
 class MLP(nn.Module):
-    """MLP layer with SiLU activation."""
+    """MLP layer with fused gate+up projection and SiluAndMul activation."""
 
-    def __init__(self, d_model: int, intermediate_size: int, hidden_act: str = "silu"):
+    def __init__(self, d_model: int, intermediate_size: int, hidden_act: str = "silu",
+                 prefix: str = ""):
         super().__init__()
-        self.gate_proj = nn.Linear(d_model, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(d_model, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, d_model, bias=False)
-        self.act_fn = nn.SiLU() if hidden_act == "silu" else nn.GELU()
+        self.intermediate_size = intermediate_size
+        if _vllm_available:
+            self.gate_up_proj = MergedColumnParallelLinear(
+                d_model,
+                [intermediate_size, intermediate_size],
+                bias=False,
+                prefix=f"{prefix}.gate_up_proj" if prefix else "gate_up_proj",
+            )
+            self.down_proj = RowParallelLinear(
+                intermediate_size, d_model, bias=False,
+                input_is_parallel=True,
+                prefix=f"{prefix}.down_proj" if prefix else "down_proj",
+            )
+            self.act_fn = SiluAndMul()
+            self._use_fused = True
+        else:
+            self.gate_proj = nn.Linear(d_model, intermediate_size, bias=False)
+            self.up_proj = nn.Linear(d_model, intermediate_size, bias=False)
+            self.down_proj = nn.Linear(intermediate_size, d_model, bias=False)
+            self.act_fn = nn.SiLU() if hidden_act == "silu" else nn.GELU()
+            self._use_fused = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._use_fused:
+            x, _ = self.gate_up_proj(x)
+            x = self.act_fn(x)
+            x, _ = self.down_proj(x)
+            return x
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -860,27 +935,49 @@ class MHADecoderLayer(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_key_value_heads or config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
+
+        # TP-aware head counts
+        tp_size = get_tensor_model_parallel_world_size()
+        self.total_num_heads = config.num_attention_heads
+        self.total_num_kv_heads = config.num_key_value_heads or config.num_attention_heads
+        self.head_dim = self.hidden_size // self.total_num_heads
+        self.num_heads = self.total_num_heads // tp_size
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
         self.max_position_embeddings = getattr(config, 'max_position_embeddings', 8192)
 
-        self.q_proj = nn.Linear(self.hidden_size, self.q_size, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.kv_size, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.kv_size, bias=False)
-        self.o_proj = nn.Linear(self.q_size, self.hidden_size, bias=False)
+        # Fused QKV — takes TOTAL heads, shards internally
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size=self.hidden_size,
+            head_size=self.head_dim,
+            total_num_heads=self.total_num_heads,
+            total_num_kv_heads=self.total_num_kv_heads,
+            bias=False,
+            prefix=f"{prefix}.qkv_proj",
+        )
 
-        # vLLM RoPE
+        # Output projection — takes TOTAL input_size, shards internally
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            self.hidden_size,
+            bias=False,
+            prefix=f"{prefix}.o_proj",
+        )
+
+        # vLLM RoPE — build rope_parameters from config's rope_scaling + rope_theta
+        rope_params = dict(getattr(config, 'rope_scaling', None) or {})
+        rope_params["rope_theta"] = getattr(config, 'rope_theta', 10000.0)
+        if "rope_type" not in rope_params:
+            rope_params["rope_type"] = "default"
         self.rotary_emb = get_rope(
             self.head_dim,
             max_position=self.max_position_embeddings,
-            rope_parameters=getattr(config, 'rope_parameters', None),
+            rope_parameters=rope_params,
         )
 
-        # vLLM Attention — handles KV cache, paging, GQA, masking
+        # vLLM Attention — takes PER-RANK heads
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -890,37 +987,40 @@ class MHADecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
-        self.mlp = MLP(config.hidden_size, config.intermediate_size, config.hidden_act)
+        self.mlp = MLP(config.hidden_size, config.intermediate_size, config.hidden_act,
+                       prefix=f"{prefix}.mlp")
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> torch.Tensor:
+        residual: Optional[torch.Tensor] = None,
+        positions: torch.Tensor = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         # hidden_states: [num_tokens, hidden_size] (2D, vLLM V1 format)
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        # Fused RMSNorm residual: norm(x, residual) -> (normed, x+residual)
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         q, k = self.rotary_emb(positions, q, k)
 
-        # vLLM Attention handles KV cache, paging, GQA, masking internally
         attn_output = self.attn(q, k, v)
 
-        hidden_states = self.o_proj(attn_output)
-        hidden_states = residual + hidden_states
+        hidden_states, _ = self.o_proj(attn_output)
 
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        # Fused post-attention norm: adds residual + norms in one kernel
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
 
-        return hidden_states
+        return hidden_states, residual
 
 
 # =============================================================================
@@ -942,29 +1042,34 @@ class MambaDecoderLayer(nn.Module):
             config, layer_idx, prefix=mamba_prefix,
             model_config=model_config, cache_config=cache_config,
         )
-        self.mlp = MLP(config.d_model, config.intermediate_size, config.hidden_act)
+        self.mlp = MLP(config.d_model, config.intermediate_size, config.hidden_act,
+                       prefix=f"{prefix}.mlp")
         self.input_layernorm = RMSNorm(config.d_model, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.d_model, eps=config.rms_norm_eps)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Fused RMSNorm residual: norm(x, residual) -> (normed, x+residual)
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         # Output tensor pattern for custom op compatibility
         output = torch.empty_like(hidden_states)
         self.mamba(hidden_states, output)
-        hidden_states = residual + output
+        hidden_states = output
 
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        # Fused post-attention norm: adds residual + norms in one kernel
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
 
-        return hidden_states
+        return hidden_states, residual
 
 
 # =============================================================================
@@ -974,12 +1079,25 @@ class MambaDecoderLayer(nn.Module):
 class MambaInLlamaMambaModel(nn.Module):
     """MambaInLlama Model backbone."""
 
-    def __init__(self, config: MambaInLlamaMambaConfig, prefix: str = "",
-                 cache_config: "CacheConfig" = None, model_config: "ModelConfig" = None):
+    def __init__(self, *, vllm_config: "VllmConfig", prefix: str = "",
+                 config: MambaInLlamaMambaConfig):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
         self.prefix = prefix
+
+        # Extract cache_config and model_config from vllm_config
+        cache_config = vllm_config.cache_config if vllm_config else None
+        model_config = vllm_config.model_config if vllm_config else None
+
+        # Register splitting op so torch.compile doesn't try to compile our custom op
+        if vllm_config is not None:
+            compilation_config = vllm_config.compilation_config
+            op_name = "vllm::mambainllama_mixer"
+            if (compilation_config.splitting_ops is not None
+                    and op_name not in compilation_config.splitting_ops):
+                compilation_config.splitting_ops.append(op_name)
+
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
 
         self.layers = nn.ModuleList()
@@ -1007,26 +1125,30 @@ class MambaInLlamaMambaModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        attn_metadata=None,
     ) -> torch.Tensor:
-        """Forward pass with vLLM state management.
+        """Forward pass with vLLM state management and fused RMSNorm residual.
 
         Args:
             input_ids: Input token IDs [num_tokens] or [batch, seq]
             positions: Position indices for RoPE [num_tokens]
-            attn_metadata: vLLM attention metadata for Mamba state indices
         """
         hidden_states = self.embed_input_ids(input_ids)
 
-        for i, layer in enumerate(self.layers):
-            if isinstance(layer, MambaDecoderLayer):
-                hidden_states = layer(hidden_states)
-            else:
-                # MHA layer — vLLM Attention handles KV cache internally
-                hidden_states = layer(hidden_states, positions)
+        # Thread residual through all layers for fused RMSNorm
+        residual = None
+        for layer in self.layers:
+            hidden_states, residual = layer(
+                hidden_states, residual=residual, positions=positions,
+            )
 
-        hidden_states = self.norm(hidden_states)
+        # Final norm fuses last residual addition
+        hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
+
+
+# Apply @support_torch_compile decorator to backbone
+if _vllm_available and _support_torch_compile is not None:
+    MambaInLlamaMambaModel = _support_torch_compile(MambaInLlamaMambaModel)
 
 
 # =============================================================================
@@ -1039,6 +1161,8 @@ if _HasInnerState is not None:
     _NativeBaseClasses.append(_HasInnerState)
 if _IsHybrid is not None:
     _NativeBaseClasses.append(_IsHybrid)
+if _SupportsMambaPrefixCaching is not None:
+    _NativeBaseClasses.append(_SupportsMambaPrefixCaching)
 _NativeBaseClasses = tuple(_NativeBaseClasses)
 
 
@@ -1046,7 +1170,7 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
     """Native vLLM-compatible MambaInLlama model.
 
     This model supports the 'generate' runner by:
-    1. Inheriting from HasInnerState and IsHybrid protocols
+    1. Inheriting from HasInnerState, IsHybrid, and SupportsMambaPrefixCaching protocols
     2. Implementing compute_logits() and sample() methods
     3. Having architecture name ending in 'ForCausalLM'
     """
@@ -1054,6 +1178,7 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
     # Protocol-required class variables for vLLM model inspection
     is_hybrid: ClassVar[Literal[True]] = True
     has_inner_state: ClassVar[Literal[True]] = True
+    supports_mamba_prefix_caching: ClassVar[Literal[True]] = True
 
     def __init__(
         self,
@@ -1080,6 +1205,8 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
                     intermediate_size=intermediate_size,
                     rms_norm_eps=getattr(hf_cfg, "rms_norm_eps", 1e-6),
                     rope_theta=getattr(hf_cfg, "rope_theta", 10000.0),
+                    max_position_embeddings=getattr(hf_cfg, "max_position_embeddings", 2048),
+                    rope_scaling=getattr(hf_cfg, "rope_scaling", None),
                 )
 
                 # Try to load mamba_config.json for Mamba-specific settings
@@ -1163,20 +1290,10 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
         self.vocab_size = config.vocab_size
         self.prefix = prefix
 
-        # Extract cache_config and model_config from vllm_config
-        cache_config = None
-        vllm_model_config = None
-        if vllm_config is not None:
-            if hasattr(vllm_config, 'cache_config'):
-                cache_config = vllm_config.cache_config
-            if hasattr(vllm_config, 'model_config'):
-                vllm_model_config = vllm_config.model_config
-
-        # Pass prefix, cache_config, and model_config to model backbone
+        # Pass vllm_config to model backbone (extracts cache_config/model_config internally)
         model_prefix = f"{prefix}.model" if prefix else "model"
         self.model = MambaInLlamaMambaModel(
-            config, prefix=model_prefix,
-            cache_config=cache_config, model_config=vllm_model_config,
+            vllm_config=vllm_config, config=config, prefix=model_prefix,
         )
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, bias=False)
 
@@ -1202,9 +1319,6 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
         self,
         input_ids: torch.Tensor = None,
         positions: torch.Tensor = None,
-        kv_caches: list = None,
-        attn_metadata=None,
-        inputs_embeds: Optional[torch.Tensor] = None,
         intermediate_tensors=None,
         **kwargs,
     ) -> torch.Tensor:
@@ -1213,12 +1327,11 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
         With vLLM V1:
         - Mamba layers get state from self.kv_cache (bound by vLLM via MambaBase)
         - Attention layers get KV cache from vLLM Attention class (via forward context)
-        - Positions and attn_metadata come from vLLM model runner
+        - Positions come from vLLM model runner
         """
         hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
-            attn_metadata=attn_metadata,
         )
 
         return hidden_states
@@ -1243,10 +1356,11 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
         """Load weights from checkpoint using vLLM weight_loader pattern.
 
         Handles weight name transformations:
-        1. mha.in_proj.weight -> split into q_proj, k_proj, v_proj
-        2. mha.out_proj.weight -> rename to o_proj.weight
+        1. mha.in_proj.weight -> split into q/k/v, load via QKVParallelLinear weight_loader
+        2. mha.out_proj.weight -> rename to o_proj.weight (RowParallelLinear)
         3. mamba.A_log -> mamba.A (via set_weight_attrs weight_loader)
         4. mamba.in_proj.weight -> split into 5 shards for MergedColumnParallelLinear
+        5. mlp.gate_proj/up_proj -> gate_up_proj shards for MergedColumnParallelLinear
         """
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
@@ -1265,27 +1379,35 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
         kv_dim = num_kv_heads * head_dim
 
         for name, loaded_weight in weights:
-            # === MHA attention: fused in_proj -> split into q, k, v ===
+            # === MHA attention: fused in_proj -> split and load via QKVParallelLinear ===
             if ".mha.in_proj.weight" in name:
                 base_name = name.replace(".mha.in_proj.weight", "")
                 q_weight = loaded_weight[:q_dim, :]
                 k_weight = loaded_weight[q_dim:q_dim + kv_dim, :]
                 v_weight = loaded_weight[q_dim + kv_dim:, :]
-                for suffix, weight in [(".q_proj.weight", q_weight),
-                                       (".k_proj.weight", k_weight),
-                                       (".v_proj.weight", v_weight)]:
-                    param_name = base_name + suffix
-                    if param_name in params_dict:
-                        param = params_dict[param_name]
-                        weight_loader = getattr(param, "weight_loader",
-                                                default_weight_loader)
-                        weight_loader(param, weight)
-                        loaded_params.add(param_name)
+                param_name = base_name + ".qkv_proj.weight"
+                if param_name not in params_dict:
+                    if name.startswith("model."):
+                        param_name = name[6:].replace(".mha.in_proj.weight", ".qkv_proj.weight")
+                    else:
+                        param_name = f"model.{name}".replace(".mha.in_proj.weight", ".qkv_proj.weight")
+                if param_name in params_dict:
+                    param = params_dict[param_name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, q_weight, "q")
+                    weight_loader(param, k_weight, "k")
+                    weight_loader(param, v_weight, "v")
+                    loaded_params.add(param_name)
                 continue
 
-            # === MHA attention: out_proj rename ===
+            # === MHA attention: out_proj rename (o_proj is now RowParallelLinear) ===
             if ".mha.out_proj." in name:
                 new_name = name.replace(".mha.out_proj.", ".o_proj.")
+                if new_name not in params_dict:
+                    if name.startswith("model."):
+                        new_name = name[6:].replace(".mha.out_proj.", ".o_proj.")
+                    else:
+                        new_name = f"model.{name}".replace(".mha.out_proj.", ".o_proj.")
                 if new_name in params_dict:
                     param = params_dict[new_name]
                     weight_loader = getattr(param, "weight_loader",
@@ -1317,6 +1439,44 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
                     shards = torch.split(loaded_weight, mamba_in_proj_sizes, dim=0)
                     for shard_id, shard_weight in enumerate(shards):
                         weight_loader(param, shard_weight, shard_id)
+                    loaded_params.add(param_name)
+                continue
+
+            # === MLP: gate_proj -> gate_up_proj shard 0 ===
+            if ".mlp.gate_proj.weight" in name:
+                param_name = name.replace(".mlp.gate_proj.weight",
+                                          ".mlp.gate_up_proj.weight")
+                if param_name not in params_dict:
+                    if name.startswith("model."):
+                        param_name = name[6:].replace(".mlp.gate_proj.weight",
+                                                      ".mlp.gate_up_proj.weight")
+                    else:
+                        param_name = f"model.{name}".replace(".mlp.gate_proj.weight",
+                                                             ".mlp.gate_up_proj.weight")
+                if param_name in params_dict:
+                    param = params_dict[param_name]
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
+                    weight_loader(param, loaded_weight, 0)
+                    loaded_params.add(param_name)
+                continue
+
+            # === MLP: up_proj -> gate_up_proj shard 1 ===
+            if ".mlp.up_proj.weight" in name:
+                param_name = name.replace(".mlp.up_proj.weight",
+                                          ".mlp.gate_up_proj.weight")
+                if param_name not in params_dict:
+                    if name.startswith("model."):
+                        param_name = name[6:].replace(".mlp.up_proj.weight",
+                                                      ".mlp.gate_up_proj.weight")
+                    else:
+                        param_name = f"model.{name}".replace(".mlp.up_proj.weight",
+                                                             ".mlp.gate_up_proj.weight")
+                if param_name in params_dict:
+                    param = params_dict[param_name]
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
+                    weight_loader(param, loaded_weight, 1)
                     loaded_params.add(param_name)
                 continue
 
@@ -1366,15 +1526,29 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
 
     @classmethod
     def get_mamba_state_dtype_from_config(cls, vllm_config) -> tuple:
-        """Get Mamba state dtypes."""
-        if _vllm_MambaStateDtypeCalculator is None:
-            return (torch.bfloat16, torch.bfloat16)
+        """Get Mamba state dtypes.
 
-        return _vllm_MambaStateDtypeCalculator.mamba1_state_dtype(
-            vllm_config.model_config.dtype,
-            vllm_config.cache_config.mamba_cache_dtype,
-            vllm_config.cache_config.mamba_ssm_cache_dtype,
+        Must match instance get_state_dtype(): SSM state defaults to float32
+        when mamba_ssm_cache_dtype is "auto" to avoid bfloat16 rounding errors.
+        """
+        if _vllm_MambaStateDtypeCalculator is None:
+            return (torch.bfloat16, torch.float32)
+
+        cache_config = vllm_config.cache_config
+        if cache_config.mamba_ssm_cache_dtype != "auto":
+            return _vllm_MambaStateDtypeCalculator.mamba1_state_dtype(
+                vllm_config.model_config.dtype,
+                cache_config.mamba_cache_dtype,
+                cache_config.mamba_ssm_cache_dtype,
+            )
+        from vllm.model_executor.layers.mamba.mamba_utils import (
+            get_kv_cache_torch_dtype,
         )
+        conv_dtype = get_kv_cache_torch_dtype(
+            cache_config.mamba_cache_dtype,
+            vllm_config.model_config.dtype,
+        )
+        return (conv_dtype, torch.float32)
 
     @classmethod
     def is_backend_compatible(cls) -> bool:
@@ -1382,8 +1556,11 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
 
 
 # =============================================================================
-# ALIAS FOR HF CONFIG COMPATIBILITY
+# ALIASES FOR HF CONFIG COMPATIBILITY
 # =============================================================================
 # HuggingFace model configs specify "MambaInLlamaMambaForCausalLM" as the
 # architecture. This alias ensures vLLM can find and load the class.
 MambaInLlamaMambaForCausalLM = MambaInLlamaMambaForCausalLMNative
+
+# New architecture alias for Qwerky models
+QwerkyLlamaMambaHybridForCausalLM = MambaInLlamaMambaForCausalLMNative

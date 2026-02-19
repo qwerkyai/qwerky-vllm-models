@@ -40,6 +40,21 @@ This package uses vLLM's plugin system (`vllm.general_plugins` entry point) to r
 
 ## Changelog
 
+### 0.2.65
+- **Speed optimizations**: Precomputed static tensors (conv_weight, D, dt_bias, multi-head views) — avoids per-forward recomputation
+- **Early slicing**: Slice to actual tokens after `in_proj` before expensive split/dt_proj/expand operations, skipping CUDA graph padding
+- **expand instead of repeat_interleave**: Zero-copy stride-0 view + single reshape for x and B expansion
+- **permute instead of rearrange**: Direct `permute()` for prefill B/C transpose, avoids einops overhead on hot path
+- **Fused MLP**: `MergedColumnParallelLinear` + `SiluAndMul` + `RowParallelLinear` (TP-ready, replaces separate gate/up projections)
+- **Fused RMSNorm residual**: Thread residual through all layers — fuses elementwise add + normalization into one CUDA kernel
+- **`@support_torch_compile`**: Applied to model backbone, registers custom op as splitting op for torch.compile exclusion
+- **Architecture alias**: `QwerkyLlamaMambaHybridForCausalLM` registered in plugin
+
+### 0.2.64
+- **FIX**: Guard `layer_metadata.block_idx_last_computed_token` with `is not None` before splitting
+- Fields are `None` during CUDA graph decode capture even when prefix caching is enabled
+- Fixes `AttributeError: 'NoneType' object has no attribute 'split'` crash with `--enable-prefix-caching`
+
 ### 0.2.63
 - **LoRA support**: `is_lora_enabled` parameter, contiguity enforcement for LoRA kernel
 - **ROCm platform check**: `current_platform.is_rocm()` contiguity for non-contiguous GEMM correctness

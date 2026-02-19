@@ -137,3 +137,9 @@ class MambaInLlamaMambaConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
+
+class QwerkyLlamaMambaHybridConfig(MambaInLlamaMambaConfig):
+    """Config alias for QwerkyAI/Qwick models that use model_type='qwerky_llama_mamba_hybrid'."""
+
+    model_type = "qwerky_llama_mamba_hybrid"

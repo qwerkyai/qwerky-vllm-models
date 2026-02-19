@@ -23,7 +23,7 @@ Usage:
     vllm serve QwerkyAI/Qwerky-Llama3.1-Mamba-8B-Llama3.3-70B-base-distill
 """
 
-__version__ = "0.2.64"
+__version__ = "0.2.66"
 
 # Track if we've already registered with Transformers
 _transformers_registered = False
@@ -37,10 +37,12 @@ def _register_with_transformers():
 
     try:
         from transformers import AutoConfig
-        from .configuration import MambaInLlamaMambaConfig
+        from .configuration import MambaInLlamaMambaConfig, QwerkyLlamaMambaHybridConfig
 
         # Register the config class for our model_type
         AutoConfig.register("mambainllama_mamba", MambaInLlamaMambaConfig)
+        # Register the Qwick model_type (subclass with matching model_type attribute)
+        AutoConfig.register("qwerky_llama_mamba_hybrid", QwerkyLlamaMambaHybridConfig)
         _transformers_registered = True
     except Exception:
         # Transformers not available or already registered
@@ -117,6 +119,15 @@ def register():
         except Exception:
             pass
 
+    if "QwerkyLlamaMambaHybridForCausalLM" not in registered:
+        try:
+            ModelRegistry.register_model(
+                "QwerkyLlamaMambaHybridForCausalLM",
+                "qwerky_vllm_models.modeling:QwerkyLlamaMambaHybridForCausalLM"
+            )
+        except Exception:
+            pass
+
 
 # Also export the model classes for direct import if needed
 def get_model_classes():
@@ -124,8 +135,10 @@ def get_model_classes():
     from .modeling import (
         MambaInLlamaMambaForCausalLM,
         MambaInLlamaMambaForCausalLMNative,
+        QwerkyLlamaMambaHybridForCausalLM,
     )
     return {
         "MambaInLlamaMambaForCausalLM": MambaInLlamaMambaForCausalLM,
         "MambaInLlamaMambaForCausalLMNative": MambaInLlamaMambaForCausalLMNative,
+        "QwerkyLlamaMambaHybridForCausalLM": QwerkyLlamaMambaHybridForCausalLM,
     }
