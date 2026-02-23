@@ -127,6 +127,7 @@ if _MambaBase is not None and _CustomOp is not None:
             model_config: "ModelConfig | None" = None,
             cache_config: "CacheConfig | None" = None,
             is_lora_enabled: bool = False,
+            quant_config=None,
         ):
             super().__init__()
             self.layer_idx = layer_idx
@@ -168,6 +169,7 @@ if _MambaBase is not None and _CustomOp is not None:
                 [self.d_inner, self.d_xb, self.d_xb, self.d_inner, self.dt_rank],
                 bias=False,
                 prefix=f"{prefix}.in_proj",
+                quant_config=quant_config,
             )
 
             # Conv1d as ColumnParallelLinear (matching vLLM MambaMixer pattern)
@@ -188,6 +190,7 @@ if _MambaBase is not None and _CustomOp is not None:
                 self.d_inner,
                 bias=True,
                 prefix=f"{prefix}.dt_proj",
+                quant_config=quant_config,
             )
 
             # A matrix with TP-aware weight loading
@@ -224,6 +227,7 @@ if _MambaBase is not None and _CustomOp is not None:
                 bias=False,
                 input_is_parallel=True,
                 prefix=f"{prefix}.out_proj",
+                quant_config=quant_config,
             )
 
             self.activation = "silu"

@@ -148,9 +148,10 @@ class MambaInLlamaMambaModel(nn.Module):
         self.prefix = prefix
         self.vllm_config = vllm_config
 
-        # Extract cache_config and model_config from vllm_config
+        # Extract cache_config, model_config, and quant_config from vllm_config
         cache_config = vllm_config.cache_config if vllm_config else None
         model_config = vllm_config.model_config if vllm_config else None
+        quant_config = getattr(vllm_config, 'quant_config', None) if vllm_config else None
 
         # Register splitting op so torch.compile doesn't try to compile our custom op
         if vllm_config is not None:
@@ -179,6 +180,7 @@ class MambaInLlamaMambaModel(nn.Module):
                 self.layers.append(MambaDecoderLayer(
                     config, layer_idx, prefix=layer_prefix,
                     model_config=model_config, cache_config=cache_config,
+                    quant_config=quant_config,
                 ))
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

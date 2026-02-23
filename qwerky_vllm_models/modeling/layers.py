@@ -84,7 +84,7 @@ class MLP(nn.Module):
     """MLP layer with fused gate+up projection and SiluAndMul activation."""
 
     def __init__(self, d_model: int, intermediate_size: int, hidden_act: str = "silu",
-                 prefix: str = ""):
+                 prefix: str = "", quant_config=None):
         super().__init__()
         self.intermediate_size = intermediate_size
         if _vllm_available:
@@ -93,11 +93,13 @@ class MLP(nn.Module):
                 [intermediate_size, intermediate_size],
                 bias=False,
                 prefix=f"{prefix}.gate_up_proj" if prefix else "gate_up_proj",
+                quant_config=quant_config,
             )
             self.down_proj = RowParallelLinear(
                 intermediate_size, d_model, bias=False,
                 input_is_parallel=True,
                 prefix=f"{prefix}.down_proj" if prefix else "down_proj",
+                quant_config=quant_config,
             )
             self.act_fn = SiluAndMul()
             self._use_fused = True
@@ -125,7 +127,8 @@ class MambaDecoderLayer(nn.Module):
     """Mamba SSM decoder layer."""
 
     def __init__(self, config: MambaInLlamaMambaConfig, layer_idx: int,
-                 prefix: str = "", model_config=None, cache_config=None):
+                 prefix: str = "", model_config=None, cache_config=None,
+                 quant_config=None):
         super().__init__()
         self.layer_idx = layer_idx
         self.prefix = prefix
@@ -135,9 +138,10 @@ class MambaDecoderLayer(nn.Module):
         self.mamba = MambaInLlamaMambaMixer(
             config, layer_idx, prefix=mamba_prefix,
             model_config=model_config, cache_config=cache_config,
+            quant_config=quant_config,
         )
         self.mlp = MLP(config.d_model, config.intermediate_size, config.hidden_act,
-                       prefix=f"{prefix}.mlp")
+                       prefix=f"{prefix}.mlp", quant_config=quant_config)
         self.input_layernorm = RMSNorm(config.d_model, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.d_model, eps=config.rms_norm_eps)
 
