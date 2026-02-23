@@ -77,7 +77,8 @@ def find_records(d: str) -> list[dict] | None:
     for m in glob.glob(os.path.join(d, "**", "profile_export*.jsonl"), recursive=True):
         if "_raw" in m:
             continue
-        recs = [json.loads(line) for line in open(m) if line.strip()]
+        with open(m, "r", encoding="utf-8") as f:
+            recs = [json.loads(line) for line in f if line.strip()]
         if recs:
             return recs
     return None
