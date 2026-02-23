@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MambaInLlama (Mamba) model configuration for vLLM plugin."""
+"""QwerkyLlamaMambaHybrid model configuration for vLLM plugin."""
 
 from typing import List, Optional
 from transformers.configuration_utils import PretrainedConfig
@@ -22,9 +22,9 @@ from transformers.utils import logging
 logger = logging.get_logger(__name__)
 
 
-class MambaInLlamaMambaConfig(PretrainedConfig):
+class QwerkyLlamaMambaHybridConfig(PretrainedConfig):
     r"""
-    Configuration class for MambaInLlama hybrid Mamba-Attention models.
+    Configuration class for QwerkyLlamaMambaHybrid (Mamba-Attention) models.
 
     This model combines Mamba SSM layers with traditional attention layers,
     distilled from larger Llama models.
@@ -68,7 +68,7 @@ class MambaInLlamaMambaConfig(PretrainedConfig):
             List of layer indices that use attention instead of Mamba.
     """
 
-    model_type = "mambainllama_mamba"
+    model_type = "qwerky_llama_mamba_hybrid"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
@@ -119,7 +119,7 @@ class MambaInLlamaMambaConfig(PretrainedConfig):
         self.attention_dropout = attention_dropout
 
         # Mamba-specific parameters with sensible defaults
-        # IMPORTANT: MambaInLlama uses d_inner = hidden_size for Mamba layers
+        # d_inner = hidden_size for Mamba layers
         # (NOT intermediate_size, which is only for MLP layers)
         self.d_model = d_model if d_model is not None else hidden_size
         self.d_inner = d_inner if d_inner is not None else hidden_size
@@ -139,7 +139,7 @@ class MambaInLlamaMambaConfig(PretrainedConfig):
         )
 
 
-class QwerkyLlamaMambaHybridConfig(MambaInLlamaMambaConfig):
-    """Config alias for QwerkyAI/Qwick models that use model_type='qwerky_llama_mamba_hybrid'."""
+class MambaInLlamaMambaConfig(QwerkyLlamaMambaHybridConfig):
+    """Backward-compat alias for models using model_type='mambainllama_mamba'."""
 
-    model_type = "qwerky_llama_mamba_hybrid"
+    model_type = "mambainllama_mamba"

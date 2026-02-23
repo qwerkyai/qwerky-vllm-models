@@ -15,7 +15,7 @@
 """
 Qwerky vLLM Models Plugin
 
-This plugin registers Qwerky AI's MambaInLlama hybrid models with vLLM,
+This plugin registers Qwerky AI's QwerkyLlamaMambaHybrid models with vLLM,
 enabling serving without the --trust-remote-code flag.
 
 Usage:
@@ -37,12 +37,12 @@ def _register_with_transformers():
 
     try:
         from transformers import AutoConfig
-        from .configuration import MambaInLlamaMambaConfig, QwerkyLlamaMambaHybridConfig
+        from .configuration import QwerkyLlamaMambaHybridConfig, MambaInLlamaMambaConfig
 
-        # Register the config class for our model_type
-        AutoConfig.register("mambainllama_mamba", MambaInLlamaMambaConfig)
-        # Register the Qwick model_type (subclass with matching model_type attribute)
+        # Register the primary config class
         AutoConfig.register("qwerky_llama_mamba_hybrid", QwerkyLlamaMambaHybridConfig)
+        # Register backward-compat config for legacy model_type
+        AutoConfig.register("mambainllama_mamba", MambaInLlamaMambaConfig)
         _transformers_registered = True
     except Exception:
         # Transformers not available or already registered
@@ -101,6 +101,26 @@ def register():
     # 2. Model class inspection (is_text_generation_model, has_inner_state, etc.)
     # 3. Protocol inheritance (HasInnerState, IsHybrid)
 
+    # Primary architecture names
+    if "QwerkyLlamaMambaHybridForCausalLMNative" not in registered:
+        try:
+            ModelRegistry.register_model(
+                "QwerkyLlamaMambaHybridForCausalLMNative",
+                "qwerky_vllm_models.modeling:QwerkyLlamaMambaHybridForCausalLMNative"
+            )
+        except Exception:
+            pass
+
+    if "QwerkyLlamaMambaHybridForCausalLM" not in registered:
+        try:
+            ModelRegistry.register_model(
+                "QwerkyLlamaMambaHybridForCausalLM",
+                "qwerky_vllm_models.modeling:QwerkyLlamaMambaHybridForCausalLM"
+            )
+        except Exception:
+            pass
+
+    # Legacy MambaInLlama architecture names (backward compat)
     if "MambaInLlamaMambaForCausalLM" not in registered:
         try:
             ModelRegistry.register_model(
@@ -119,26 +139,19 @@ def register():
         except Exception:
             pass
 
-    if "QwerkyLlamaMambaHybridForCausalLM" not in registered:
-        try:
-            ModelRegistry.register_model(
-                "QwerkyLlamaMambaHybridForCausalLM",
-                "qwerky_vllm_models.modeling:QwerkyLlamaMambaHybridForCausalLM"
-            )
-        except Exception:
-            pass
-
 
 # Also export the model classes for direct import if needed
 def get_model_classes():
     """Get the model classes (triggers actual import)."""
     from .modeling import (
+        QwerkyLlamaMambaHybridForCausalLMNative,
+        QwerkyLlamaMambaHybridForCausalLM,
         MambaInLlamaMambaForCausalLM,
         MambaInLlamaMambaForCausalLMNative,
-        QwerkyLlamaMambaHybridForCausalLM,
     )
     return {
+        "QwerkyLlamaMambaHybridForCausalLMNative": QwerkyLlamaMambaHybridForCausalLMNative,
+        "QwerkyLlamaMambaHybridForCausalLM": QwerkyLlamaMambaHybridForCausalLM,
         "MambaInLlamaMambaForCausalLM": MambaInLlamaMambaForCausalLM,
         "MambaInLlamaMambaForCausalLMNative": MambaInLlamaMambaForCausalLMNative,
-        "QwerkyLlamaMambaHybridForCausalLM": QwerkyLlamaMambaHybridForCausalLM,
     }
