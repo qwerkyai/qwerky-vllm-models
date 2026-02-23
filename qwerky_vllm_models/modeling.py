@@ -79,7 +79,6 @@ try:
     from vllm.model_executor.layers.linear import (
         ColumnParallelLinear,
         MergedColumnParallelLinear,
-        QKVParallelLinear,
         RowParallelLinear,
     )
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -89,8 +88,6 @@ try:
     )
     from vllm.model_executor.model_loader.weight_utils import default_weight_loader
     from vllm.model_executor.utils import set_weight_attrs
-    from vllm.attention.layer import Attention
-    from vllm.model_executor.layers.rotary_embedding import get_rope
     from vllm.distributed import get_tensor_model_parallel_world_size
     from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
     from vllm.platforms import current_platform
@@ -106,6 +103,14 @@ except ImportError as e:
     RMSNorm = None
     get_current_vllm_config = None
     get_forward_context = None
+
+# LlamaDecoderLayer import for MHA layers (replaces our custom MHADecoderLayer)
+_LlamaDecoderLayer = None
+try:
+    from vllm.model_executor.models.llama import LlamaDecoderLayer as _LlamaDecoderLayer
+    logger.info("vLLM LlamaDecoderLayer loaded successfully")
+except ImportError as e:
+    logger.warning(f"vLLM LlamaDecoderLayer not available: {e}")
 
 # MambaBase import for proper vLLM integration
 _MambaBase = None
@@ -222,17 +227,6 @@ class RMSNormFallback(nn.Module):
 
 if RMSNorm is None:
     RMSNorm = RMSNormFallback
-
-
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """Repeat KV heads."""
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch, num_key_value_heads, n_rep, slen, head_dim
-    )
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
 # =============================================================================
@@ -623,6 +617,7 @@ if _MambaBase is not None and _CustomOp is not None:
                     initial_state_idx=block_idx_last_computed_token_p,
                     num_computed_tokens=num_computed_tokens_p,
                     block_size_to_align=self.mamba_block_size,
+                    metadata=layer_metadata,
                 )
 
                 # SSM scan
@@ -647,7 +642,8 @@ if _MambaBase is not None and _CustomOp is not None:
                     initial_state_idx=block_idx_last_computed_token_p,
                 )
 
-                ssm_outputs.append(y_p)
+                # Transpose to tokens-first immediately (tokens, d_inner)
+                ssm_outputs.append(y_p.transpose(0, 1))
 
             if has_decode:
                 # Decode tokens are first
@@ -715,26 +711,24 @@ if _MambaBase is not None and _CustomOp is not None:
                     out=scan_outputs_d,
                 )
 
-                # Reshape back to (d_inner_local, num_decode) for cat with prefill
+                # Keep tokens-first: (num_decode, d_inner_local)
                 scan_outputs_d = scan_outputs_d.reshape(
                     -1, self.d_inner_local
-                ).transpose(0, 1)
+                )
 
                 ssm_outputs.insert(0, scan_outputs_d)  # decode comes first
 
-            # Combine and project
+            # Combine in tokens-first layout and project
+            # All ssm_outputs are now (tokens, d_inner_local)
             # RowParallelLinear returns (output, bias) tuple
             y_combined = (
                 ssm_outputs[0] if len(ssm_outputs) == 1
-                else torch.cat(ssm_outputs, dim=-1)
+                else torch.cat(ssm_outputs, dim=0)
             )
             if self.is_lora_enabled:
-                # LoRA kernel requires contiguous tensor
-                out = self.out_proj(
-                    y_combined.transpose(0, 1).contiguous()
-                )[0]
+                out = self.out_proj(y_combined.contiguous())[0]
             else:
-                out = self.out_proj(y_combined.transpose(0, 1))[0]
+                out = self.out_proj(y_combined)[0]
             output[:num_actual_tokens] = out
 
 else:
@@ -920,110 +914,6 @@ class MLP(nn.Module):
 
 
 # =============================================================================
-# ATTENTION LAYER
-# =============================================================================
-
-class MHADecoderLayer(nn.Module):
-    """Multi-Head Attention decoder layer using vLLM's Attention for KV caching.
-
-    Uses vLLM's Attention class which handles KV cache, PagedAttention,
-    GQA, causal masking, and flash attention internally.
-    """
-
-    def __init__(self, config: MambaInLlamaMambaConfig, layer_idx: int,
-                 cache_config: "CacheConfig" = None, prefix: str = ""):
-        super().__init__()
-        self.layer_idx = layer_idx
-        self.hidden_size = config.hidden_size
-
-        # TP-aware head counts
-        tp_size = get_tensor_model_parallel_world_size()
-        self.total_num_heads = config.num_attention_heads
-        self.total_num_kv_heads = config.num_key_value_heads or config.num_attention_heads
-        self.head_dim = self.hidden_size // self.total_num_heads
-        self.num_heads = self.total_num_heads // tp_size
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
-        self.max_position_embeddings = getattr(config, 'max_position_embeddings', 8192)
-
-        # Fused QKV — takes TOTAL heads, shards internally
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size=self.hidden_size,
-            head_size=self.head_dim,
-            total_num_heads=self.total_num_heads,
-            total_num_kv_heads=self.total_num_kv_heads,
-            bias=False,
-            prefix=f"{prefix}.qkv_proj",
-        )
-
-        # Output projection — takes TOTAL input_size, shards internally
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            self.hidden_size,
-            bias=False,
-            prefix=f"{prefix}.o_proj",
-        )
-
-        # vLLM RoPE — build rope_parameters from config's rope_scaling + rope_theta
-        rope_params = dict(getattr(config, 'rope_scaling', None) or {})
-        rope_params["rope_theta"] = getattr(config, 'rope_theta', 10000.0)
-        if "rope_type" not in rope_params:
-            rope_params["rope_type"] = "default"
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            max_position=self.max_position_embeddings,
-            rope_parameters=rope_params,
-        )
-
-        # vLLM Attention — takes PER-RANK heads
-        self.attn = Attention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            cache_config=cache_config,
-            prefix=f"{prefix}.attn",
-        )
-
-        self.mlp = MLP(config.hidden_size, config.intermediate_size, config.hidden_act,
-                       prefix=f"{prefix}.mlp")
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
-        positions: torch.Tensor = None,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # hidden_states: [num_tokens, hidden_size] (2D, vLLM V1 format)
-        # Fused RMSNorm residual: norm(x, residual) -> (normed, x+residual)
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
-        q, k = self.rotary_emb(positions, q, k)
-
-        attn_output = self.attn(q, k, v)
-
-        hidden_states, _ = self.o_proj(attn_output)
-
-        # Fused post-attention norm: adds residual + norms in one kernel
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
-
-        return hidden_states, residual
-
-
-# =============================================================================
 # MAMBA DECODER LAYER
 # =============================================================================
 
@@ -1049,9 +939,9 @@ class MambaDecoderLayer(nn.Module):
 
     def forward(
         self,
+        positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
-        **kwargs,
+        residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Fused RMSNorm residual: norm(x, residual) -> (normed, x+residual)
         if residual is None:
@@ -1085,6 +975,7 @@ class MambaInLlamaMambaModel(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
         self.prefix = prefix
+        self.vllm_config = vllm_config
 
         # Extract cache_config and model_config from vllm_config
         cache_config = vllm_config.cache_config if vllm_config else None
@@ -1101,12 +992,16 @@ class MambaInLlamaMambaModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
 
         self.layers = nn.ModuleList()
+        if config.attn_layers and _LlamaDecoderLayer is None:
+            raise RuntimeError(
+                "LlamaDecoderLayer could not be imported from vllm.model_executor.models.llama. "
+                "Attention layers require vLLM >= 0.14.0."
+            )
         for layer_idx in range(config.num_hidden_layers):
             layer_prefix = f"{prefix}.layers.{layer_idx}" if prefix else f"model.layers.{layer_idx}"
             if layer_idx in config.attn_layers:
-                self.layers.append(MHADecoderLayer(
-                    config, layer_idx,
-                    cache_config=cache_config,
+                self.layers.append(_LlamaDecoderLayer(
+                    vllm_config=vllm_config,
                     prefix=layer_prefix,
                 ))
             else:
@@ -1137,9 +1032,7 @@ class MambaInLlamaMambaModel(nn.Module):
         # Thread residual through all layers for fused RMSNorm
         residual = None
         for layer in self.layers:
-            hidden_states, residual = layer(
-                hidden_states, residual=residual, positions=positions,
-            )
+            hidden_states, residual = layer(positions, hidden_states, residual)
 
         # Final norm fuses last residual addition
         hidden_states, _ = self.norm(hidden_states, residual)
@@ -1356,8 +1249,8 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
         """Load weights from checkpoint using vLLM weight_loader pattern.
 
         Handles weight name transformations:
-        1. mha.in_proj.weight -> split into q/k/v, load via QKVParallelLinear weight_loader
-        2. mha.out_proj.weight -> rename to o_proj.weight (RowParallelLinear)
+        1. mha.in_proj.weight -> split into q/k/v, load via self_attn.qkv_proj (LlamaDecoderLayer)
+        2. mha.out_proj.weight -> rename to self_attn.o_proj.weight (LlamaDecoderLayer)
         3. mamba.A_log -> mamba.A (via set_weight_attrs weight_loader)
         4. mamba.in_proj.weight -> split into 5 shards for MergedColumnParallelLinear
         5. mlp.gate_proj/up_proj -> gate_up_proj shards for MergedColumnParallelLinear
@@ -1380,34 +1273,36 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
 
         for name, loaded_weight in weights:
             # === MHA attention: fused in_proj -> split and load via QKVParallelLinear ===
+            # LlamaDecoderLayer stores attention as self_attn.qkv_proj
             if ".mha.in_proj.weight" in name:
                 base_name = name.replace(".mha.in_proj.weight", "")
                 q_weight = loaded_weight[:q_dim, :]
                 k_weight = loaded_weight[q_dim:q_dim + kv_dim, :]
                 v_weight = loaded_weight[q_dim + kv_dim:, :]
-                param_name = base_name + ".qkv_proj.weight"
+                param_name = base_name + ".self_attn.qkv_proj.weight"
                 if param_name not in params_dict:
                     if name.startswith("model."):
-                        param_name = name[6:].replace(".mha.in_proj.weight", ".qkv_proj.weight")
+                        param_name = name[6:].replace(".mha.in_proj.weight", ".self_attn.qkv_proj.weight")
                     else:
-                        param_name = f"model.{name}".replace(".mha.in_proj.weight", ".qkv_proj.weight")
+                        param_name = f"model.{name}".replace(".mha.in_proj.weight", ".self_attn.qkv_proj.weight")
                 if param_name in params_dict:
                     param = params_dict[param_name]
-                    weight_loader = param.weight_loader
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
                     weight_loader(param, q_weight, "q")
                     weight_loader(param, k_weight, "k")
                     weight_loader(param, v_weight, "v")
                     loaded_params.add(param_name)
                 continue
 
-            # === MHA attention: out_proj rename (o_proj is now RowParallelLinear) ===
+            # === MHA attention: out_proj rename (LlamaDecoderLayer uses self_attn.o_proj) ===
             if ".mha.out_proj." in name:
-                new_name = name.replace(".mha.out_proj.", ".o_proj.")
+                new_name = name.replace(".mha.out_proj.", ".self_attn.o_proj.")
                 if new_name not in params_dict:
                     if name.startswith("model."):
-                        new_name = name[6:].replace(".mha.out_proj.", ".o_proj.")
+                        new_name = name[6:].replace(".mha.out_proj.", ".self_attn.o_proj.")
                     else:
-                        new_name = f"model.{name}".replace(".mha.out_proj.", ".o_proj.")
+                        new_name = f"model.{name}".replace(".mha.out_proj.", ".self_attn.o_proj.")
                 if new_name in params_dict:
                     param = params_dict[new_name]
                     weight_loader = getattr(param, "weight_loader",
