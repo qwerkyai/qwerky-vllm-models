@@ -15,14 +15,14 @@ Tools for evaluation:
 python benchmarks/logged_aiperf.py \
     --wandb_args "<wandb params>" \
     --aiperf_args "<aiperf params>" \
-    [--artifact_dir <path>]
+    [--output_dir <path>]
 ```
 
 | Argument | Required | Description |
 |---|---|---|
 | `--aiperf_args` | yes | Comma-separated aiperf params (`key=value` or bare flags) |
 | `--wandb_args` | yes | Comma-separated W&B params (`project=`, `entity=`, `name=`, etc.) |
-| `--artifact_dir` | no | Directory to keep aiperf output files. If omitted, a temp dir is used and deleted after upload |
+| `--output_dir` | no | Directory to keep aiperf output files. If omitted, a temp dir is used and deleted after upload |
 
 ### Example
 

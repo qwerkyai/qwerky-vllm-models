@@ -151,22 +151,22 @@ def main():
         "--wandb_args", required=True, help='"project=X,entity=Y,name=Z,..."'
     )
     p.add_argument(
-        "--artifact_dir",
+        "--output_dir",
         default=None,
         help="Where aiperf writes output (kept after run; default: temp 'artifacts/' dir, deleted after upload)",
     )
     args = p.parse_args()
 
-    keep_artifacts = args.artifact_dir is not None
-    if args.artifact_dir is None:
-        args.artifact_dir = "artifacts"
+    keep_artifacts = args.output_dir is not None
+    if args.output_dir is None:
+        args.output_dir = "artifacts"
 
     # Parse raw strings
     ai_kv, ai_bare = parse_kv_string(args.aiperf_args)
     wb_kv, wb_bare = parse_kv_string(args.wandb_args)
 
     # Build aiperf command
-    cmd = ["aiperf", "profile"] + kv_to_aiperf_cmd(ai_kv, ai_bare)
+    cmd = ["aiperf", "profile", "--output-artifact-dir", args.output_dir] + kv_to_aiperf_cmd(ai_kv, ai_bare)
     log.info("Executing %s", " ".join(shlex.quote(c) for c in cmd))
 
     # Init W&B
@@ -187,9 +187,9 @@ def main():
         sys.exit(rc)
 
     # Parse & log results
-    jp = find_json_artifact(args.artifact_dir)
+    jp = find_json_artifact(args.output_dir)
     if not jp:
-        log.warning("No JSON results in %s/", args.artifact_dir)
+        log.warning("No JSON results in %s/", args.output_dir)
         if wb_active:
             wandb.finish()
         return
@@ -215,7 +215,7 @@ def main():
             wandb.log({"summary_table": st})
 
         # Per-request records
-        recs = find_records(args.artifact_dir)
+        recs = find_records(args.output_dir)
         if recs:
             cols = sorted({k for r in recs for k in r})
             t = wandb.Table(columns=cols)
@@ -225,17 +225,17 @@ def main():
 
         # Upload artifacts
         art = wandb.Artifact(f"aiperf-{wandb.run.id}", type="benchmark")
-        if os.path.isdir(args.artifact_dir):
-            art.add_dir(args.artifact_dir)
+        if os.path.isdir(args.output_dir):
+            art.add_dir(args.output_dir)
             wandb.log_artifact(art)
 
         log.info("W&B run: %s", wandb.run.url)
         wandb.finish()
 
     # Cleanup: remove artifact dir if it wasn't explicitly requested
-    if not keep_artifacts and os.path.isdir(args.artifact_dir):
-        shutil.rmtree(args.artifact_dir)
-        log.info("Removed temp artifact dir: %s", args.artifact_dir)
+    if not keep_artifacts and os.path.isdir(args.output_dir):
+        shutil.rmtree(args.output_dir)
+        log.info("Removed temp artifact dir: %s", args.output_dir)
 
 
 if __name__ == "__main__":
