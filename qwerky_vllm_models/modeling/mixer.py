@@ -599,10 +599,12 @@ if _MambaBase is not None and _CustomOp is not None:
                 ssm_outputs[0] if len(ssm_outputs) == 1
                 else torch.cat(ssm_outputs, dim=0)
             )
-            if self.is_lora_enabled:
-                out = self.out_proj(y_combined.contiguous())[0]
-            else:
-                out = self.out_proj(y_combined)[0]
+            # Ensure contiguity: prefill path produces non-contiguous
+            # tensor via transpose(0,1), and FP8/LoRA GEMM kernels
+            # require stride(1)==1 (row-major contiguous)
+            if not y_combined.is_contiguous():
+                y_combined = y_combined.contiguous()
+            out = self.out_proj(y_combined)[0]
             output[:num_actual_tokens] = out
 
 else:
