@@ -23,7 +23,7 @@ Usage:
     vllm serve QwerkyAI/Qwerky-Llama3.1-Mamba-8B-Llama3.3-70B-base-distill
 """
 
-__version__ = "0.2.69"
+__version__ = "0.2.70"
 
 # Track if we've already registered with Transformers
 _transformers_registered = False
@@ -128,6 +128,15 @@ def register():
         except Exception:
             pass
 
+    if "QwerkyMamba2HybridForCausalLM" not in registered:
+        try:
+            ModelRegistry.register_model(
+                "QwerkyMamba2HybridForCausalLM",
+                "qwerky_vllm_models.modeling:QwerkyMamba2HybridForCausalLM"
+            )
+        except Exception:
+            pass
+
 
 # Also export the model classes for direct import if needed
 def get_model_classes():
@@ -136,9 +145,11 @@ def get_model_classes():
         MambaInLlamaMambaForCausalLM,
         MambaInLlamaMambaForCausalLMNative,
         QwerkyLlamaMambaHybridForCausalLM,
+        QwerkyMamba2HybridForCausalLM,
     )
     return {
         "MambaInLlamaMambaForCausalLM": MambaInLlamaMambaForCausalLM,
         "MambaInLlamaMambaForCausalLMNative": MambaInLlamaMambaForCausalLMNative,
         "QwerkyLlamaMambaHybridForCausalLM": QwerkyLlamaMambaHybridForCausalLM,
+        "QwerkyMamba2HybridForCausalLM": QwerkyMamba2HybridForCausalLM,
     }

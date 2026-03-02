@@ -97,6 +97,14 @@ class MambaInLlamaMambaConfig(PretrainedConfig):
         d_xb: int = 1024,
         ssm_cfg: Optional[dict] = None,
         attn_layers: Optional[List[int]] = None,
+        # Mamba 2 parameters (used when mamba_version == "Mamba2")
+        mamba_version: str = "Mamba1",
+        mamba_n_groups: Optional[int] = None,
+        mamba_num_heads: Optional[int] = None,
+        mamba_head_dim: Optional[int] = None,
+        ssm_state_size: Optional[int] = None,
+        d_conv: int = 4,
+        mamba_intermediate_size: Optional[int] = None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -129,6 +137,15 @@ class MambaInLlamaMambaConfig(PretrainedConfig):
         self.d_xb = d_xb if d_xb is not None else (self.num_key_value_heads * head_dim)
         self.ssm_cfg = ssm_cfg if ssm_cfg is not None else {}
         self.attn_layers = attn_layers if attn_layers is not None else []
+
+        # Mamba 2 parameters
+        self.mamba_version = mamba_version
+        self.mamba_n_groups = mamba_n_groups
+        self.mamba_num_heads = mamba_num_heads
+        self.mamba_head_dim = mamba_head_dim
+        self.ssm_state_size = ssm_state_size
+        self.d_conv = d_conv
+        self.mamba_intermediate_size = mamba_intermediate_size
 
         super().__init__(
             pad_token_id=pad_token_id,

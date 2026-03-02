@@ -19,10 +19,11 @@ vLLM's ModelRegistry loads via importlib.import_module("qwerky_vllm_models.model
 then getattr(mod, "ClassName"), so all classes must be accessible here.
 """
 from .mixer import MambaInLlamaMambaMixer  # noqa: F401
-from .layers import MambaDecoderLayer, MLP, RMSNorm  # noqa: F401
+from .layers import MambaDecoderLayer, Mamba2DecoderLayer, MLP, RMSNorm  # noqa: F401
 from .model import (  # noqa: F401
     MambaInLlamaMambaModel,
     MambaInLlamaMambaForCausalLMNative,
     MambaInLlamaMambaForCausalLM,
     QwerkyLlamaMambaHybridForCausalLM,
+    QwerkyMamba2HybridForCausalLM,
 )

@@ -20,7 +20,8 @@ The plugin automatically registers the model architecture with vLLM on import.
 
 ## Supported Models
 
-- `QwerkyAI/Qwerky-Llama3.2-Mamba-3B-Llama3.3-70B-base-distill`
+- `QwerkyAI/Qwerky-Llama3.2-Mamba-3B-Llama3.3-70B-base-distill` (Mamba 1 hybrid)
+- `QwerkyAI/HybridMamba2-Exp6umrbg19-full` (Mamba 2 hybrid)
 
 ## How It Works
 
@@ -31,6 +32,7 @@ This package uses vLLM's plugin system (`vllm.general_plugins` entry point) to r
 - Works with standard vLLM installation
 - CUDA graph support for optimized decode latency
 - Uses vLLM's native Triton-accelerated Mamba kernels
+- Mamba 2 support via vLLM's built-in `MambaMixer2` (chunked semi-parallel SSD scan)
 
 ## Requirements
 
@@ -39,6 +41,45 @@ This package uses vLLM's plugin system (`vllm.general_plugins` entry point) to r
 - PyTorch >= 2.0.0
 
 ## Changelog
+
+### 0.2.70
+- **Mamba 2 hybrid model support** via vLLM's built-in `MambaMixer2` layer
+- New `Mamba2DecoderLayer` wrapping `MambaMixer2` — gets CUDA graphs, prefix caching, TP, and FP8 for free
+- Backbone dispatches `Mamba2DecoderLayer` vs `MambaDecoderLayer` based on `mamba_version` config field
+- Dynamic `mamba_in_proj_sizes` for Mamba 2 weight loading (`[gate, x, B, C, dt]` split)
+- State shape/dtype delegates to `mamba2_state_shape()` / `mamba2_state_dtype()` for Mamba 2 models
+- New architecture: `QwerkyMamba2HybridForCausalLM` registered in plugin
+- 7 new Mamba 2 config fields: `mamba_version`, `mamba_n_groups`, `mamba_num_heads`, `mamba_head_dim`, `ssm_state_size`, `d_conv`, `mamba_intermediate_size`
+- All Mamba 1 code unchanged — fully backward compatible
+
+### 0.2.69
+- **FP8 quantization support**: Wire `quant_config` through all Mamba layers
+- `quant_config` passed to `MambaInLlamaMambaMixer` (in_proj, dt_proj, out_proj), `MLP` (gate_up_proj, down_proj), and `MambaDecoderLayer`
+- conv1d intentionally excluded (tiny depthwise conv, no benefit from quantization)
+- With `--quantization fp8` on H100: enables FP8 for all major GEMMs in all layers
+- No regression without quantization (`quant_config=None` is a no-op)
+
+### 0.2.68
+- **Multi-file restructure**: Split `modeling.py` (1462 lines) into `modeling/` package
+- `modeling/mixer.py`: `MambaInLlamaMambaMixer` + custom op registration (~600 lines)
+- `modeling/layers.py`: `RMSNorm` fallback, `MLP`, `MambaDecoderLayer` (~150 lines)
+- `modeling/model.py`: Backbone, CausalLM, weight loading, aliases (~500 lines)
+- `modeling/__init__.py`: Re-exports all public classes for backward compatibility
+- Zero functional change — all import paths preserved
+
+### 0.2.67
+- **Replace custom MHADecoderLayer with vLLM's native `LlamaDecoderLayer`**
+- Gets quant_config support, proper RoPE (via vLLM's `patch_rope_parameters`), and future vLLM patches for free
+- Weight mapping: `mha.in_proj` → `self_attn.qkv_proj` (split q/k/v), `mha.out_proj` → `self_attn.o_proj`
+- Unified backbone forward: `layer(positions, hidden_states, residual)` for all layer types
+- Removes ~100 lines of custom attention code
+
+### 0.2.66
+- **MHA tensor parallelism**: `QKVParallelLinear` + `RowParallelLinear` for attention layers
+- **RoPE config fix**: `max_position_embeddings` passed correctly (was capped at 2048 with torch.compile)
+- **HF accuracy parity achieved**: mmlu 0.35→0.44, hellaswag_norm 0.58→0.63, gsm8k 0.09→0.47
+- Register `QwerkyLlamaMambaHybridConfig` with `AutoConfig`
+- **Metadata optimization**: Pass `metadata=layer_metadata` to `causal_conv1d_fn`, eliminating 28 CPU syncs/prefill (+6% throughput)
 
 ### 0.2.65
 - **Speed optimizations**: Precomputed static tensors (conv_weight, D, dt_bias, multi-head views) — avoids per-forward recomputation

@@ -29,7 +29,7 @@ import torch.nn as nn
 from transformers.utils import logging
 
 from ..configuration import MambaInLlamaMambaConfig
-from .layers import MambaDecoderLayer, MLP, RMSNorm
+from .layers import MambaDecoderLayer, Mamba2DecoderLayer, MLP, RMSNorm
 
 logger = logging.get_logger(__name__)
 
@@ -153,10 +153,14 @@ class MambaInLlamaMambaModel(nn.Module):
         model_config = vllm_config.model_config if vllm_config else None
         quant_config = getattr(vllm_config, 'quant_config', None) if vllm_config else None
 
-        # Register splitting op so torch.compile doesn't try to compile our custom op
+        # Register splitting ops so torch.compile doesn't try to compile our custom ops
+        is_mamba2 = getattr(config, 'mamba_version', 'Mamba1') == 'Mamba2'
         if vllm_config is not None:
             compilation_config = vllm_config.compilation_config
-            op_name = "vllm::mambainllama_mixer"
+            if is_mamba2:
+                op_name = "vllm::mamba_mixer2"
+            else:
+                op_name = "vllm::mambainllama_mixer"
             if (compilation_config.splitting_ops is not None
                     and op_name not in compilation_config.splitting_ops):
                 compilation_config.splitting_ops.append(op_name)
@@ -175,6 +179,12 @@ class MambaInLlamaMambaModel(nn.Module):
                 self.layers.append(_LlamaDecoderLayer(
                     vllm_config=vllm_config,
                     prefix=layer_prefix,
+                ))
+            elif is_mamba2:
+                self.layers.append(Mamba2DecoderLayer(
+                    config, layer_idx, prefix=layer_prefix,
+                    model_config=model_config, cache_config=cache_config,
+                    quant_config=quant_config,
                 ))
             else:
                 self.layers.append(MambaDecoderLayer(
@@ -346,7 +356,27 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
                 elif hasattr(hf_cfg, "ssm_cfg") and hf_cfg.ssm_cfg is not None:
                     config_kwargs["ssm_cfg"] = hf_cfg.ssm_cfg
 
-                logger.info(f"Final config_kwargs: d_inner={config_kwargs.get('d_inner')}, d_xb={config_kwargs.get('d_xb')}, attn_layers={config_kwargs.get('attn_layers')}")
+                # Mamba 2 parameters — priority: mamba_config.json > hf_config
+                mamba_version = (
+                    mamba_cfg.get("mamba_version")
+                    or getattr(hf_cfg, "mamba_version", None)
+                )
+                if mamba_version:
+                    config_kwargs["mamba_version"] = mamba_version
+                if mamba_cfg.get("n_groups"):
+                    config_kwargs["mamba_n_groups"] = mamba_cfg["n_groups"]
+                if mamba_cfg.get("num_heads"):
+                    config_kwargs["mamba_num_heads"] = mamba_cfg["num_heads"]
+                if mamba_cfg.get("head_dim"):
+                    config_kwargs["mamba_head_dim"] = mamba_cfg["head_dim"]
+                if mamba_cfg.get("ssm_state_size"):
+                    config_kwargs["ssm_state_size"] = mamba_cfg["ssm_state_size"]
+                if mamba_cfg.get("d_conv"):
+                    config_kwargs["d_conv"] = mamba_cfg["d_conv"]
+                if mamba_cfg.get("mamba_intermediate_size"):
+                    config_kwargs["mamba_intermediate_size"] = mamba_cfg["mamba_intermediate_size"]
+
+                logger.info(f"Final config_kwargs: d_inner={config_kwargs.get('d_inner')}, d_xb={config_kwargs.get('d_xb')}, attn_layers={config_kwargs.get('attn_layers')}, mamba_version={config_kwargs.get('mamba_version', 'Mamba1')}")
                 config = MambaInLlamaMambaConfig(**config_kwargs)
 
         if config is None:
@@ -431,11 +461,22 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
-        # Mamba in_proj shard sizes: [z, x, B, C, dt]
-        d_inner = self.config.d_inner
-        d_xb = self.config.d_xb
-        dt_rank = math.ceil(self.config.d_model / 16)
-        mamba_in_proj_sizes = [d_inner, d_xb, d_xb, d_inner, dt_rank]
+        # Mamba in_proj shard sizes depend on Mamba version
+        is_mamba2 = getattr(self.config, 'mamba_version', 'Mamba1') == 'Mamba2'
+        if is_mamba2:
+            m2_intermediate = getattr(self.config, 'mamba_intermediate_size', None) or self.config.d_model
+            m2_n_groups = getattr(self.config, 'mamba_n_groups', 1)
+            m2_ssm_state = getattr(self.config, 'ssm_state_size', 64)
+            m2_num_heads = getattr(self.config, 'mamba_num_heads', 128)
+            groups_ssm_state_size = m2_n_groups * m2_ssm_state
+            # Mamba 2 in_proj: [gate, x, B, C, dt]
+            mamba_in_proj_sizes = [m2_intermediate, m2_intermediate, groups_ssm_state_size, groups_ssm_state_size, m2_num_heads]
+        else:
+            # Mamba 1 in_proj: [z, x, B, C, dt]
+            d_inner = self.config.d_inner
+            d_xb = self.config.d_xb
+            dt_rank = math.ceil(self.config.d_model / 16)
+            mamba_in_proj_sizes = [d_inner, d_xb, d_xb, d_inner, dt_rank]
 
         # MHA attention dimensions for QKV split
         num_heads = self.config.num_attention_heads
@@ -445,6 +486,39 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
         kv_dim = num_kv_heads * head_dim
 
         for name, loaded_weight in weights:
+            # === Quantization scale/zero-point tensors: route to default handler ===
+            # compressed-tensors format adds weight_scale, input_scale, etc.
+            # These must NOT be caught by the substring-based weight handlers below.
+            if name.endswith(("_scale", "_zero_point")):
+                # Apply same name remappings as for weights
+                param_name = name
+                shard_id = None
+                if ".mha.in_proj." in param_name:
+                    param_name = param_name.replace(".mha.in_proj.", ".self_attn.qkv_proj.")
+                elif ".mha.out_proj." in param_name:
+                    param_name = param_name.replace(".mha.out_proj.", ".self_attn.o_proj.")
+                elif ".mlp.gate_proj." in param_name:
+                    param_name = param_name.replace(".mlp.gate_proj.", ".mlp.gate_up_proj.")
+                    shard_id = 0
+                elif ".mlp.up_proj." in param_name:
+                    param_name = param_name.replace(".mlp.up_proj.", ".mlp.gate_up_proj.")
+                    shard_id = 1
+                if param_name not in params_dict:
+                    if param_name.startswith("model."):
+                        param_name = param_name[6:]
+                    else:
+                        param_name = f"model.{param_name}"
+                if param_name in params_dict:
+                    param = params_dict[param_name]
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
+                    if shard_id is not None:
+                        weight_loader(param, loaded_weight, shard_id)
+                    else:
+                        weight_loader(param, loaded_weight)
+                    loaded_params.add(param_name)
+                continue
+
             # === MHA attention: fused in_proj -> split and load via QKVParallelLinear ===
             # LlamaDecoderLayer stores attention as self_attn.qkv_proj
             if ".mha.in_proj.weight" in name:
@@ -579,6 +653,25 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
 
         hf_config = vllm_config.model_config.hf_config
         parallel_config = vllm_config.parallel_config
+        mamba_version = getattr(hf_config, 'mamba_version', 'Mamba1')
+
+        if mamba_version == 'Mamba2':
+            n_groups = getattr(hf_config, 'mamba_n_groups', 1)
+            num_heads = getattr(hf_config, 'mamba_num_heads', 128)
+            head_dim = getattr(hf_config, 'mamba_head_dim', 64)
+            ssm_state_size = getattr(hf_config, 'ssm_state_size', 64)
+            d_conv = getattr(hf_config, 'd_conv', 4)
+            intermediate_size = getattr(hf_config, 'mamba_intermediate_size', None) or hf_config.hidden_size
+
+            return _vllm_MambaStateShapeCalculator.mamba2_state_shape(
+                tp_world_size=parallel_config.tensor_parallel_size,
+                intermediate_size=intermediate_size,
+                n_groups=n_groups,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                state_size=ssm_state_size,
+                conv_kernel=d_conv,
+            )
 
         d_inner = getattr(hf_config, "d_inner", hf_config.hidden_size)
         ssm_cfg = getattr(hf_config, "ssm_cfg", {})
@@ -602,7 +695,17 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
         if _vllm_MambaStateDtypeCalculator is None:
             return (torch.bfloat16, torch.float32)
 
+        hf_config = vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
+        mamba_version = getattr(hf_config, 'mamba_version', 'Mamba1')
+
+        if mamba_version == 'Mamba2':
+            return _vllm_MambaStateDtypeCalculator.mamba2_state_dtype(
+                vllm_config.model_config.dtype,
+                cache_config.mamba_cache_dtype,
+                cache_config.mamba_ssm_cache_dtype,
+            )
+
         if cache_config.mamba_ssm_cache_dtype != "auto":
             return _vllm_MambaStateDtypeCalculator.mamba1_state_dtype(
                 vllm_config.model_config.dtype,
@@ -632,3 +735,6 @@ MambaInLlamaMambaForCausalLM = MambaInLlamaMambaForCausalLMNative
 
 # New architecture alias for Qwerky models
 QwerkyLlamaMambaHybridForCausalLM = MambaInLlamaMambaForCausalLMNative
+
+# Mamba 2 hybrid architecture alias
+QwerkyMamba2HybridForCausalLM = MambaInLlamaMambaForCausalLMNative

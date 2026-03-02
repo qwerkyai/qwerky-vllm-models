@@ -35,6 +35,7 @@ logger = logging.get_logger(__name__)
 
 _vllm_available = False
 RMSNorm = None
+_MambaMixer2 = None
 
 try:
     from vllm.model_executor.layers.layernorm import RMSNorm
@@ -44,6 +45,11 @@ try:
     )
     from vllm.model_executor.layers.activation import SiluAndMul
     _vllm_available = True
+except ImportError:
+    pass
+
+try:
+    from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2 as _MambaMixer2
 except ImportError:
     pass
 
@@ -164,6 +170,70 @@ class MambaDecoderLayer(nn.Module):
         hidden_states = output
 
         # Fused post-attention norm: adds residual + norms in one kernel
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
+
+        return hidden_states, residual
+
+
+# =============================================================================
+# MAMBA 2 DECODER LAYER
+# =============================================================================
+
+class Mamba2DecoderLayer(nn.Module):
+    """Mamba 2 SSM decoder layer wrapping vLLM's MambaMixer2."""
+
+    def __init__(self, config: MambaInLlamaMambaConfig, layer_idx: int,
+                 prefix: str = "", model_config=None, cache_config=None,
+                 quant_config=None):
+        super().__init__()
+        if _MambaMixer2 is None:
+            raise RuntimeError(
+                "MambaMixer2 could not be imported from vllm.model_executor.layers.mamba.mamba_mixer2. "
+                "Mamba 2 layers require vLLM >= 0.16.0."
+            )
+        self.layer_idx = layer_idx
+        self.prefix = prefix
+
+        mamba_prefix = f"{prefix}.mamba" if prefix else f"model.layers.{layer_idx}.mamba"
+        self.mamba = _MambaMixer2(
+            hidden_size=config.d_model,
+            ssm_state_size=config.ssm_state_size or 64,
+            conv_kernel_size=config.d_conv,
+            intermediate_size=config.mamba_intermediate_size or config.d_model,
+            use_conv_bias=True,
+            use_bias=False,
+            n_groups=config.mamba_n_groups or 1,
+            num_heads=config.mamba_num_heads or 128,
+            head_dim=config.mamba_head_dim or 64,
+            rms_norm_eps=config.rms_norm_eps,
+            activation="silu",
+            use_rms_norm=True,
+            model_config=model_config,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            prefix=mamba_prefix,
+        )
+        self.mlp = MLP(config.d_model, config.intermediate_size, config.hidden_act,
+                       prefix=f"{prefix}.mlp", quant_config=quant_config)
+        self.input_layernorm = RMSNorm(config.d_model, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.d_model, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        # MambaMixer2 returns output directly (handles custom op internally)
+        hidden_states = self.mamba(hidden_states)
+
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
 
