@@ -569,7 +569,7 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
                     loaded_params.add(new_name)
                 continue
 
-            # === Mamba in_proj: split fused weight into 5 shards ===
+            # === Mamba in_proj: split fused weight into shards ===
             if ".mamba.in_proj.weight" in name:
                 param_name = name
                 if param_name not in params_dict:
@@ -578,9 +578,14 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
                     param = params_dict[param_name]
                     weight_loader = getattr(param, "weight_loader",
                                             default_weight_loader)
-                    shards = torch.split(loaded_weight, mamba_in_proj_sizes, dim=0)
-                    for shard_id, shard_weight in enumerate(shards):
-                        weight_loader(param, shard_weight, shard_id)
+                    if is_mamba2:
+                        # MambaMixer2's weight_loader handles sharding internally
+                        weight_loader(param, loaded_weight)
+                    else:
+                        # Mamba 1: manually split and load via MergedColumnParallelLinear
+                        shards = torch.split(loaded_weight, mamba_in_proj_sizes, dim=0)
+                        for shard_id, shard_weight in enumerate(shards):
+                            weight_loader(param, shard_weight, shard_id)
                     loaded_params.add(param_name)
                 continue
 
