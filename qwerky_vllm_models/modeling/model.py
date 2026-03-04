@@ -158,7 +158,7 @@ class MambaInLlamaMambaModel(nn.Module):
         if vllm_config is not None:
             compilation_config = vllm_config.compilation_config
             if is_mamba2:
-                op_name = "vllm::mamba_mixer2"
+                op_name = "vllm::mamba2inllama_mixer"
             else:
                 op_name = "vllm::mambainllama_mixer"
             if (compilation_config.splitting_ops is not None
@@ -569,7 +569,7 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
                     loaded_params.add(new_name)
                 continue
 
-            # === Mamba in_proj: split fused weight into 5 shards ===
+            # === Mamba in_proj: load directly for Mamba2 (qwerky layout) ===
             if ".mamba.in_proj.weight" in name:
                 param_name = name
                 if param_name not in params_dict:
@@ -578,9 +578,15 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
                     param = params_dict[param_name]
                     weight_loader = getattr(param, "weight_loader",
                                             default_weight_loader)
-                    shards = torch.split(loaded_weight, mamba_in_proj_sizes, dim=0)
-                    for shard_id, shard_weight in enumerate(shards):
-                        weight_loader(param, shard_weight, shard_id)
+                    if is_mamba2:
+                        # QwerkyMamba2Mixer stores weights in qwerky's layout
+                        # [z, x, B, C, dt]; load the full matrix directly.
+                        weight_loader(param, loaded_weight)
+                    else:
+                        # Mamba1: split into 5 shards and load via shard_id
+                        shards = torch.split(loaded_weight, mamba_in_proj_sizes, dim=0)
+                        for shard_id, shard_weight in enumerate(shards):
+                            weight_loader(param, shard_weight, shard_id)
                     loaded_params.add(param_name)
                 continue
 
@@ -656,17 +662,46 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
         mamba_version = getattr(hf_config, 'mamba_version', 'Mamba1')
 
         if mamba_version == 'Mamba2':
-            n_groups = getattr(hf_config, 'mamba_n_groups', 1)
-            num_heads = getattr(hf_config, 'mamba_num_heads', 128)
-            head_dim = getattr(hf_config, 'mamba_head_dim', 64)
-            ssm_state_size = getattr(hf_config, 'ssm_state_size', 64)
-            d_conv = getattr(hf_config, 'd_conv', 4)
-            intermediate_size = getattr(hf_config, 'mamba_intermediate_size', None) or hf_config.hidden_size
+            # config.json typically uses model_type="llama" so hf_config won't have
+            # Mamba2-specific fields. Load them from mamba_config.json directly.
+            mamba_cfg = {}
+            model_path = getattr(vllm_config.model_config, 'model', '')
+            if model_path:
+                try:
+                    from huggingface_hub import hf_hub_download
+                    mamba_config_path = hf_hub_download(model_path, "mamba_config.json")
+                    with open(mamba_config_path, "r") as f:
+                        mamba_cfg = json.load(f)
+                except Exception:
+                    mamba_cfg = _load_mamba_config(model_path)
+
+            num_heads = (mamba_cfg.get("num_heads")
+                         or getattr(hf_config, 'mamba_num_heads', 128))
+            head_dim = (mamba_cfg.get("head_dim")
+                        or getattr(hf_config, 'mamba_head_dim', 64))
+            ssm_state_size = (mamba_cfg.get("ssm_state_size")
+                              or getattr(hf_config, 'ssm_state_size', 64))
+            d_conv = (mamba_cfg.get("d_conv")
+                      or getattr(hf_config, 'd_conv', 4))
+            d_xb = (mamba_cfg.get("d_xb")
+                    or getattr(hf_config, 'd_xb', None))
+            intermediate_size = (
+                mamba_cfg.get("mamba_intermediate_size")
+                or mamba_cfg.get("d_inner")
+                or getattr(hf_config, 'mamba_intermediate_size', None)
+                or hf_config.hidden_size
+            )
+            # n_groups for conv_dim: use d_xb // ssm_state_size (qwerky-distill layout)
+            if d_xb:
+                n_groups_conv = d_xb // ssm_state_size
+            else:
+                n_groups_conv = (mamba_cfg.get("n_groups")
+                                 or getattr(hf_config, 'mamba_n_groups', 1))
 
             return _vllm_MambaStateShapeCalculator.mamba2_state_shape(
                 tp_world_size=parallel_config.tensor_parallel_size,
                 intermediate_size=intermediate_size,
-                n_groups=n_groups,
+                n_groups=n_groups_conv,
                 num_heads=num_heads,
                 head_dim=head_dim,
                 state_size=ssm_state_size,

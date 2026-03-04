@@ -98,6 +98,28 @@ try:
 except ImportError:
     pass
 
+# MambaMixer2 base class for Mamba2 hybrid layers
+_MambaMixer2 = None
+try:
+    from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2 as _MambaMixer2
+except ImportError:
+    try:
+        from vllm.model_executor.layers.mamba.mamba2inllama_mixer import MambaMixer2 as _MambaMixer2
+    except ImportError:
+        pass
+
+_Mixer2RMSNormGated = None
+try:
+    from vllm.model_executor.layers.mamba.mamba_mixer2 import Mixer2RMSNormGated as _Mixer2RMSNormGated
+except ImportError:
+    pass
+
+_default_weight_loader = None
+try:
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader as _default_weight_loader
+except ImportError:
+    pass
+
 
 # =============================================================================
 # MAMBAINLLAMA MAMBA MIXER (Custom Op Pattern for CUDA Graphs)
@@ -745,4 +767,185 @@ if _vllm_available:
         op_func=_mambainllama_mixer_op,
         mutates_args=["output"],
         fake_impl=_mambainllama_mixer_fake,
+    )
+
+
+# =============================================================================
+# MAMBA2INLLAMA MAMBA MIXER (Mamba2 with qwerky-distill layout)
+# =============================================================================
+
+if _MambaMixer2 is not None and _CustomOp is not None:
+    @_CustomOp.register("mamba2inllama_mixer")
+    class Mamba2InLlamaMambaMixer(_MambaMixer2):
+        """MambaInLlama Mamba2 mixer adapted for qwerky-distill's weight layout.
+
+        qwerky-distill uses a different in_proj layout from standard Mamba2:
+          checkpoint: [z(d_inner), x(d_xb), B(d_xb), C(d_inner), dt(nheads)]
+          vLLM stock: [gate(d_inner), x(d_inner), B(n_groups*state), C(n_groups*state), dt(nheads)]
+
+        In qwerky-distill, x and B are "small" (d_xb = n_groups_conv * state_size) and are
+        repeated repeat_group times to become per-head, while C is already per-head (d_inner).
+        This class overrides the split function and norm group structure so that the
+        parent's conv_ssm_forward correctly implements qwerky's computation.
+        """
+
+        def __init__(
+            self,
+            hidden_size: int,
+            ssm_state_size: int,
+            conv_kernel_size: int,
+            intermediate_size: int,
+            use_conv_bias: bool,
+            use_bias: bool,
+            d_xb: int,
+            n_groups_ssm: int,
+            rms_norm_eps: float = 1e-5,
+            use_rms_norm: bool = True,
+            activation: str = "silu",
+            model_config=None,
+            cache_config=None,
+            quant_config=None,
+            prefix: str = "",
+        ):
+            # n_groups_conv: determines conv_dim = intermediate_size + 2*n_groups_conv*ssm_state_size
+            # Must match checkpoint's conv1d shape: d_xb // ssm_state_size groups
+            n_groups_conv = d_xb // ssm_state_size
+            head_dim = intermediate_size // n_groups_ssm
+
+            super().__init__(
+                hidden_size=hidden_size,
+                ssm_state_size=ssm_state_size,
+                conv_kernel_size=conv_kernel_size,
+                intermediate_size=intermediate_size,
+                use_conv_bias=use_conv_bias,
+                use_bias=use_bias,
+                n_groups=n_groups_conv,
+                num_heads=n_groups_ssm,
+                head_dim=head_dim,
+                rms_norm_eps=rms_norm_eps,
+                use_rms_norm=use_rms_norm,
+                activation=activation,
+                model_config=model_config,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=prefix,
+            )
+
+            self.d_xb = d_xb
+            self.repeat_group = intermediate_size // d_xb  # = d_inner / d_xb
+
+            # Override n_groups from n_groups_conv → n_groups_ssm so that
+            # conv_ssm_forward reshapes B and C as (tokens, n_groups_ssm, state_size)
+            # i.e. per-head B and C, matching qwerky-distill's computation.
+            self.n_groups = n_groups_ssm
+
+            # Recreate norm with the correct per-head group structure.
+            # qwerky-distill uses group_size = d_state = ssm_state_size (= head_dim),
+            # whereas parent initialised it with group_size = d_inner // n_groups_conv.
+            if _Mixer2RMSNormGated is not None:
+                self.norm = _Mixer2RMSNormGated(
+                    intermediate_size, n_groups_ssm, use_rms_norm, eps=rms_norm_eps
+                )
+
+            # Override the split function so the 5120-channel conv output is split as
+            # qwerky-distill's [x(d_xb), B(d_xb), C(d_inner)] rather than vLLM's
+            # [x(d_inner), B(n_groups_conv*state), C(n_groups_conv*state)].
+            # After split, x and B are expanded to d_inner via repeat_interleave.
+            tp = self.tp_size
+            d_xb_tp = d_xb // tp
+            d_inner_tp = intermediate_size // tp
+            state_size = ssm_state_size
+            repeat = self.repeat_group
+
+            def _qwerky_split(hidden_states_B_C):
+                x, B, C = torch.split(
+                    hidden_states_B_C, [d_xb_tp, d_xb_tp, d_inner_tp], dim=-1
+                )
+                # Expand x and B: (tokens, d_xb_tp) → (tokens, d_inner_tp) via repeat.
+                # Each group of `state_size` values is repeated `repeat` times,
+                # matching the repeat_kv operation in qwerky-distill's forward pass.
+                x = x.reshape(*x.shape[:-1], -1, state_size).repeat_interleave(
+                    repeat, dim=-2
+                ).flatten(-2)
+                B = B.reshape(*B.shape[:-1], -1, state_size).repeat_interleave(
+                    repeat, dim=-2
+                ).flatten(-2)
+                return x, B, C
+
+            self.split_hidden_states_B_C_fn = _qwerky_split
+
+            # Use direct (non-shard) weight loaders so the checkpoint weights are
+            # stored in memory in qwerky's layout and our custom split_fn can handle them.
+            if _default_weight_loader is not None:
+                for param in [self.in_proj.weight, self.conv1d.weight, self.conv1d.bias]:
+                    if hasattr(param, "weight_loader"):
+                        delattr(param, "weight_loader")
+                    set_weight_attrs(param, {"weight_loader": _default_weight_loader})
+
+        def forward(self, hidden_states: torch.Tensor, mup_vector: torch.Tensor | None = None):
+            """Override to dispatch via mamba2inllama_mixer custom op."""
+            projected_states, _ = self.in_proj(hidden_states)
+            if mup_vector is not None:
+                projected_states = projected_states * mup_vector
+
+            ssm_output = torch.empty(
+                [hidden_states.shape[0],
+                 (self.num_heads // self.tp_size) * self.head_dim],
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+
+            torch.ops.vllm.mamba2inllama_mixer(
+                projected_states, ssm_output, self.prefix
+            )
+
+            gate = projected_states[..., :self.tped_intermediate_size]
+            hidden_states = self.norm(ssm_output, gate)
+            output, _ = self.out_proj(hidden_states)
+            return output
+
+        def forward_native(self, hidden_states: torch.Tensor, output: torch.Tensor):
+            """Empty stub — conv_ssm_forward handles computation via custom op."""
+            pass
+
+        def get_state_shape(self):
+            """Return cache shapes using n_groups_conv (not n_groups_ssm) for conv_dim."""
+            n_groups_conv = self.d_xb // self.ssm_state_size
+            return _vllm_MambaStateShapeCalculator.mamba2_state_shape(
+                tp_world_size=get_tensor_model_parallel_world_size(),
+                intermediate_size=self.intermediate_size,
+                n_groups=n_groups_conv,
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                state_size=self.ssm_state_size,
+                conv_kernel=self.conv_kernel_size,
+            )
+
+else:
+    Mamba2InLlamaMambaMixer = None
+
+
+# Register custom op for mamba2inllama_mixer
+if _vllm_available:
+    def _mamba2inllama_mixer_op(
+        projected_states: torch.Tensor,
+        output: torch.Tensor,
+        layer_name: str,
+    ) -> None:
+        forward_context: ForwardContext = get_forward_context()
+        self = forward_context.no_compile_layers[layer_name]
+        self.conv_ssm_forward(projected_states=projected_states, output=output)
+
+    def _mamba2inllama_mixer_fake(
+        projected_states: torch.Tensor,
+        output: torch.Tensor,
+        layer_name: str,
+    ) -> None:
+        return
+
+    direct_register_custom_op(
+        op_name="mamba2inllama_mixer",
+        op_func=_mamba2inllama_mixer_op,
+        mutates_args=["output"],
+        fake_impl=_mamba2inllama_mixer_fake,
     )

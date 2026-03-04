@@ -25,7 +25,7 @@ import torch.nn as nn
 from transformers.utils import logging
 
 from ..configuration import MambaInLlamaMambaConfig
-from .mixer import MambaInLlamaMambaMixer
+from .mixer import MambaInLlamaMambaMixer, Mamba2InLlamaMambaMixer
 
 logger = logging.get_logger(__name__)
 
@@ -35,7 +35,6 @@ logger = logging.get_logger(__name__)
 
 _vllm_available = False
 RMSNorm = None
-_MambaMixer2 = None
 
 try:
     from vllm.model_executor.layers.layernorm import RMSNorm
@@ -45,11 +44,6 @@ try:
     )
     from vllm.model_executor.layers.activation import SiluAndMul
     _vllm_available = True
-except ImportError:
-    pass
-
-try:
-    from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2 as _MambaMixer2
 except ImportError:
     pass
 
@@ -181,31 +175,36 @@ class MambaDecoderLayer(nn.Module):
 # =============================================================================
 
 class Mamba2DecoderLayer(nn.Module):
-    """Mamba 2 SSM decoder layer wrapping vLLM's MambaMixer2."""
+    """Mamba 2 SSM decoder layer using Mamba2InLlamaMambaMixer."""
 
     def __init__(self, config: MambaInLlamaMambaConfig, layer_idx: int,
                  prefix: str = "", model_config=None, cache_config=None,
                  quant_config=None):
         super().__init__()
-        if _MambaMixer2 is None:
+        if Mamba2InLlamaMambaMixer is None:
             raise RuntimeError(
-                "MambaMixer2 could not be imported from vllm.model_executor.layers.mamba.mamba_mixer2. "
+                "MambaMixer2 could not be imported from vllm.model_executor.layers.mamba. "
                 "Mamba 2 layers require vLLM >= 0.16.0."
             )
         self.layer_idx = layer_idx
         self.prefix = prefix
 
         mamba_prefix = f"{prefix}.mamba" if prefix else f"model.layers.{layer_idx}.mamba"
-        self.mamba = _MambaMixer2(
+        ssm_state_size = config.ssm_state_size or 64
+        intermediate_size = config.mamba_intermediate_size or config.d_model
+        # n_groups_ssm = number of SSM heads (= mamba_num_heads in config)
+        n_groups_ssm = config.mamba_num_heads or 128
+        # d_xb: the small B/C projection size (per-group before repeat)
+        d_xb = config.d_xb or intermediate_size
+        self.mamba = Mamba2InLlamaMambaMixer(
             hidden_size=config.d_model,
-            ssm_state_size=config.ssm_state_size or 64,
+            ssm_state_size=ssm_state_size,
             conv_kernel_size=config.d_conv,
-            intermediate_size=config.mamba_intermediate_size or config.d_model,
+            intermediate_size=intermediate_size,
             use_conv_bias=True,
             use_bias=False,
-            n_groups=config.mamba_n_groups or 1,
-            num_heads=config.mamba_num_heads or 128,
-            head_dim=config.mamba_head_dim or 64,
+            d_xb=d_xb,
+            n_groups_ssm=n_groups_ssm,
             rms_norm_eps=config.rms_norm_eps,
             activation="silu",
             use_rms_norm=True,
