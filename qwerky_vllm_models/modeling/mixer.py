@@ -277,7 +277,6 @@ if _MambaBase is not None and _CustomOp is not None:
             # Precomputed static tensors (lazily initialized on first forward)
             self._precomputed = False
 
-
         def _precompute_static_tensors(self):
             """Precompute static tensor views/conversions once after weight loading to avoid per-forward recomputation."""
             self._conv_weight = self.conv1d.weight.reshape(
@@ -291,7 +290,6 @@ if _MambaBase is not None and _CustomOp is not None:
             self._D_mh = self._D_float.view(nheads, head_dim)
             self._dt_bias_mh = self._dt_bias_float.view(nheads, head_dim)
             self._precomputed = True
-
 
         # MambaBase interface (required for V1 cache allocation)
         def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -354,7 +352,6 @@ if _MambaBase is not None and _CustomOp is not None:
         def mamba_type(self) -> str:
             """Return mamba type for vLLM backend selection."""
             return "mamba1"
-
 
         # CustomOp forward methods
         def forward(self, hidden_states: torch.Tensor, output: torch.Tensor):
