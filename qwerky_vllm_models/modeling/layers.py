@@ -275,7 +275,7 @@ class Mamba2DecoderLayer(nn.Module):
             f"{prefix}.mamba" if prefix else f"model.layers.{layer_idx}.mamba"
         )
         ssm_state_size = config.ssm_state_size or 64
-        intermediate_size = config.mamba_intermediate_size or config.d_model
+        intermediate_size = config.d_inner or config.d_model
         # n_groups_ssm = number of SSM heads (= mamba_num_heads in config)
         n_groups_ssm = config.mamba_num_heads or 128
         # d_xb: the small B/C projection size (per-group before repeat)

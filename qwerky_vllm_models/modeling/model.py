@@ -403,27 +403,45 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
                 elif hasattr(hf_cfg, "d_xb") and hf_cfg.d_xb is not None:
                     config_kwargs["d_xb"] = hf_cfg.d_xb
 
-                if mamba_cfg.get("ssm_config"):
-                    config_kwargs["ssm_cfg"] = mamba_cfg["ssm_config"]
+                ssm_config = mamba_cfg.get("ssm_config") or {}
+                if ssm_config:
+                    config_kwargs["ssm_cfg"] = ssm_config
                 elif hasattr(hf_cfg, "ssm_cfg") and hf_cfg.ssm_cfg is not None:
                     config_kwargs["ssm_cfg"] = hf_cfg.ssm_cfg
 
                 # Mamba 2 parameters — priority: mamba_config.json > hf_config
-                mamba_version = mamba_cfg.get("mamba_version") or getattr(
-                    hf_cfg, "mamba_version", None
+                mamba_version = (
+                    ssm_config.get("layer")
+                    or mamba_cfg.get("mamba_version")
+                    or getattr(hf_cfg, "mamba_version", None)
                 )
                 if mamba_version:
                     config_kwargs["mamba_version"] = mamba_version
-                if mamba_cfg.get("n_groups"):
-                    config_kwargs["mamba_n_groups"] = mamba_cfg["n_groups"]
-                if mamba_cfg.get("num_heads"):
+
+                n_groups = ssm_config.get("ngroups") or mamba_cfg.get("n_groups")
+                if n_groups:
+                    config_kwargs["mamba_n_groups"] = n_groups
+
+                headdim = ssm_config.get("headdim") or mamba_cfg.get("head_dim")
+                if headdim:
+                    config_kwargs["mamba_head_dim"] = headdim
+                    d_model_val = mamba_cfg.get("d_model") or config_kwargs.get(
+                        "d_model"
+                    )
+                    if d_model_val:
+                        config_kwargs["mamba_num_heads"] = d_model_val // headdim
+                elif mamba_cfg.get("num_heads"):
                     config_kwargs["mamba_num_heads"] = mamba_cfg["num_heads"]
-                if mamba_cfg.get("head_dim"):
-                    config_kwargs["mamba_head_dim"] = mamba_cfg["head_dim"]
-                if mamba_cfg.get("ssm_state_size"):
-                    config_kwargs["ssm_state_size"] = mamba_cfg["ssm_state_size"]
+
+                ssm_state_size = ssm_config.get("dim_state") or mamba_cfg.get(
+                    "ssm_state_size"
+                )
+                if ssm_state_size:
+                    config_kwargs["ssm_state_size"] = ssm_state_size
+
                 if mamba_cfg.get("d_conv"):
                     config_kwargs["d_conv"] = mamba_cfg["d_conv"]
+
                 if mamba_cfg.get("mamba_intermediate_size"):
                     config_kwargs["mamba_intermediate_size"] = mamba_cfg[
                         "mamba_intermediate_size"
@@ -521,8 +539,10 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
         # Mamba in_proj shard sizes depend on Mamba version
         is_mamba2 = getattr(self.config, "mamba_version", "Mamba1") == "Mamba2"
         if is_mamba2:
+            # mamba_intermediate_size -> d_inner
             m2_intermediate = (
-                getattr(self.config, "mamba_intermediate_size", None)
+                self.config.d_inner
+                or getattr(self.config, "mamba_intermediate_size", None)
                 or self.config.d_model
             )
             m2_n_groups = getattr(self.config, "mamba_n_groups", 1)
@@ -755,37 +775,54 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
 
         hf_config = vllm_config.model_config.hf_config
         parallel_config = vllm_config.parallel_config
-        mamba_version = getattr(hf_config, "mamba_version", "Mamba1")
+
+        # Load mamba_config.json to get Mamba-specific fields (including mamba_version)
+        mamba_cfg = {}
+        model_path = getattr(vllm_config.model_config, "model", "")
+        if model_path:
+            try:
+                from huggingface_hub import hf_hub_download
+
+                mamba_config_path = hf_hub_download(model_path, "mamba_config.json")
+                with open(mamba_config_path, "r") as f:
+                    mamba_cfg = json.load(f)
+            except Exception:
+                mamba_cfg = _load_mamba_config(model_path)
+
+        ssm_config = mamba_cfg.get("ssm_config") or {}
+        mamba_version = (
+            ssm_config.get("layer")
+            or mamba_cfg.get("mamba_version")
+            or getattr(hf_config, "mamba_version", "Mamba1")
+        )
 
         if mamba_version == "Mamba2":
-            # config.json typically uses model_type="llama" so hf_config won't have
-            # Mamba2-specific fields. Load them from mamba_config.json directly.
-            mamba_cfg = {}
-            model_path = getattr(vllm_config.model_config, "model", "")
-            if model_path:
-                try:
-                    from huggingface_hub import hf_hub_download
-
-                    mamba_config_path = hf_hub_download(model_path, "mamba_config.json")
-                    with open(mamba_config_path, "r") as f:
-                        mamba_cfg = json.load(f)
-                except Exception:
-                    mamba_cfg = _load_mamba_config(model_path)
-
-            num_heads = mamba_cfg.get("num_heads") or getattr(
-                hf_config, "mamba_num_heads", 128
+            headdim = (
+                ssm_config.get("headdim")
+                or mamba_cfg.get("head_dim")
+                or getattr(hf_config, "mamba_head_dim", 64)
             )
-            head_dim = mamba_cfg.get("head_dim") or getattr(
-                hf_config, "mamba_head_dim", 64
+            d_model_val = mamba_cfg.get("d_model") or hf_config.hidden_size
+            num_heads = (
+                (d_model_val // headdim)
+                if headdim
+                else (
+                    mamba_cfg.get("num_heads")
+                    or getattr(hf_config, "mamba_num_heads", 128)
+                )
             )
-            ssm_state_size = mamba_cfg.get("ssm_state_size") or getattr(
-                hf_config, "ssm_state_size", 64
+            head_dim = headdim
+            ssm_state_size = (
+                ssm_config.get("dim_state")
+                or mamba_cfg.get("ssm_state_size")
+                or getattr(hf_config, "ssm_state_size", 64)
             )
+            # d_conv: not in config (default 4)
             d_conv = mamba_cfg.get("d_conv") or getattr(hf_config, "d_conv", 4)
             d_xb = mamba_cfg.get("d_xb") or getattr(hf_config, "d_xb", None)
             intermediate_size = (
-                mamba_cfg.get("mamba_intermediate_size")
-                or mamba_cfg.get("d_inner")
+                mamba_cfg.get("d_inner")
+                or mamba_cfg.get("mamba_intermediate_size")
                 or getattr(hf_config, "mamba_intermediate_size", None)
                 or hf_config.hidden_size
             )
@@ -793,8 +830,10 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
             if d_xb:
                 n_groups_conv = d_xb // ssm_state_size
             else:
-                n_groups_conv = mamba_cfg.get("n_groups") or getattr(
-                    hf_config, "mamba_n_groups", 1
+                n_groups_conv = (
+                    ssm_config.get("ngroups")
+                    or mamba_cfg.get("n_groups")
+                    or getattr(hf_config, "mamba_n_groups", 1)
                 )
 
             return _vllm_MambaStateShapeCalculator.mamba2_state_shape(
@@ -831,7 +870,24 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
 
         hf_config = vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
-        mamba_version = getattr(hf_config, "mamba_version", "Mamba1")
+        # Load mamba_config.json to detect mamba_version
+        mamba_cfg = {}
+        model_path = getattr(vllm_config.model_config, "model", "")
+        if model_path:
+            try:
+                from huggingface_hub import hf_hub_download
+
+                mamba_config_path = hf_hub_download(model_path, "mamba_config.json")
+                with open(mamba_config_path, "r") as f:
+                    mamba_cfg = json.load(f)
+            except Exception:
+                mamba_cfg = _load_mamba_config(model_path)
+        ssm_config = mamba_cfg.get("ssm_config") or {}
+        mamba_version = (
+            ssm_config.get("layer")
+            or mamba_cfg.get("mamba_version")
+            or getattr(hf_config, "mamba_version", "Mamba1")
+        )
 
         if mamba_version == "Mamba2":
             return _vllm_MambaStateDtypeCalculator.mamba2_state_dtype(
