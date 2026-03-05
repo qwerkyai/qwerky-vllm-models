@@ -32,10 +32,7 @@ from ..configuration import MambaInLlamaMambaConfig
 
 logger = logging.get_logger(__name__)
 
-# =============================================================================
-# vLLM IMPORTS
-# =============================================================================
-
+# vLLM imports
 _vllm_available = False
 
 try:
@@ -129,10 +126,6 @@ try:
 except ImportError:
     pass
 
-
-# =============================================================================
-# MAMBAINLLAMA MAMBA MIXER (Custom Op Pattern for CUDA Graphs)
-# =============================================================================
 
 if _MambaBase is not None and _CustomOp is not None:
 
@@ -284,12 +277,9 @@ if _MambaBase is not None and _CustomOp is not None:
             # Precomputed static tensors (lazily initialized on first forward)
             self._precomputed = False
 
-        # =================================================================
-        # Precomputed static tensors (avoid per-forward recomputation)
-        # =================================================================
 
         def _precompute_static_tensors(self):
-            """Precompute static tensor views/conversions once after weight loading."""
+            """Precompute static tensor views/conversions once after weight loading to avoid per-forward recomputation."""
             self._conv_weight = self.conv1d.weight.reshape(
                 self.conv_dim_local, self.d_conv
             )
@@ -302,10 +292,8 @@ if _MambaBase is not None and _CustomOp is not None:
             self._dt_bias_mh = self._dt_bias_float.view(nheads, head_dim)
             self._precomputed = True
 
-        # =================================================================
-        # MambaBase interface (required for V1 cache allocation)
-        # =================================================================
 
+        # MambaBase interface (required for V1 cache allocation)
         def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
             """Return state shapes for vLLM cache allocation.
 
@@ -367,10 +355,8 @@ if _MambaBase is not None and _CustomOp is not None:
             """Return mamba type for vLLM backend selection."""
             return "mamba1"
 
-        # =================================================================
-        # CustomOp forward methods
-        # =================================================================
 
+        # CustomOp forward methods
         def forward(self, hidden_states: torch.Tensor, output: torch.Tensor):
             """Dispatch via custom op for CUDA graph compatibility.
 
@@ -465,7 +451,7 @@ if _MambaBase is not None and _CustomOp is not None:
                 block_idx_first_scheduled_token_p = None
                 num_computed_tokens_p = None
 
-            # ===== PROJECTION =====
+            # PROJECTION
             # Process all tokens (including CUDA graph padding) through in_proj
             # MergedColumnParallelLinear returns (output, bias) tuple
             # LoRA kernel requires contiguous tensor; ROCm non-contiguous
@@ -511,7 +497,7 @@ if _MambaBase is not None and _CustomOp is not None:
             # C is already d_inner_local, just reshape (direct view)
             C = C.view(-1, self.num_heads_local, self.d_state)
 
-            # ===== SPLIT AND PROCESS =====
+            # SPLIT AND PROCESS
             # In V1: decode tokens come first, then prefill tokens
             ssm_outputs = []
 
@@ -806,10 +792,6 @@ if _vllm_available:
         fake_impl=_mambainllama_mixer_fake,
     )
 
-
-# =============================================================================
-# MAMBA2INLLAMA MAMBA MIXER (Mamba2 with qwerky-distill layout)
-# =============================================================================
 
 if _MambaMixer2 is not None and _CustomOp is not None:
 

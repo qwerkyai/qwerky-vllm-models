@@ -33,6 +33,7 @@ from .mixer import MambaInLlamaMambaMixer, Mamba2InLlamaMambaMixer
 logger = logging.get_logger(__name__)
 
 
+# Extra utilities
 def _resolve_model_dir(model_config) -> Optional[str]:
     """Return local directory path for the model checkpoint, or None."""
     model = getattr(model_config, "model", None)
@@ -79,10 +80,7 @@ def _checkpoint_has_key(model_config, key: str) -> bool:
     return True  # safe default
 
 
-# =============================================================================
-# vLLM IMPORTS
-# =============================================================================
-
+# vLLM imports
 _vllm_available = False
 RMSNorm = None
 
@@ -97,11 +95,6 @@ try:
     _vllm_available = True
 except ImportError:
     pass
-
-
-# =============================================================================
-# FALLBACK IMPLEMENTATIONS
-# =============================================================================
 
 
 class RMSNormFallback(nn.Module):
@@ -127,11 +120,6 @@ class RMSNormFallback(nn.Module):
 
 if RMSNorm is None:
     RMSNorm = RMSNormFallback
-
-
-# =============================================================================
-# MLP LAYER
-# =============================================================================
 
 
 class MLP(nn.Module):
@@ -179,11 +167,6 @@ class MLP(nn.Module):
             x, _ = self.down_proj(x)
             return x
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-
-
-# =============================================================================
-# MAMBA DECODER LAYER
-# =============================================================================
 
 
 class MambaDecoderLayer(nn.Module):
@@ -247,11 +230,6 @@ class MambaDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
 
         return hidden_states, residual
-
-
-# =============================================================================
-# MAMBA 2 DECODER LAYER
-# =============================================================================
 
 
 class Mamba2DecoderLayer(nn.Module):

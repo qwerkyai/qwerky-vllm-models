@@ -65,10 +65,7 @@ def _load_mamba_config(model_path: str) -> dict:
     return mamba_config
 
 
-# =============================================================================
-# vLLM IMPORTS
-# =============================================================================
-
+# vLLM imports
 _vllm_available = False
 
 try:
@@ -133,11 +130,6 @@ try:
     )
 except ImportError:
     pass
-
-
-# =============================================================================
-# MODEL BACKBONE
-# =============================================================================
 
 
 class MambaInLlamaMambaModel(nn.Module):
@@ -257,10 +249,7 @@ if _vllm_available and _support_torch_compile is not None:
     MambaInLlamaMambaModel = _support_torch_compile(MambaInLlamaMambaModel)
 
 
-# =============================================================================
 # NATIVE vLLM MODEL CLASS
-# =============================================================================
-
 # Dynamically create base classes with protocol inheritance
 _NativeBaseClasses = [nn.Module]
 if _HasInnerState is not None:
@@ -572,7 +561,7 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
         kv_dim = num_kv_heads * head_dim
 
         for name, loaded_weight in weights:
-            # === Quantization scale/zero-point tensors: route to default handler ===
+            # Quantization scale/zero-point tensors: route to default handler
             # compressed-tensors format adds weight_scale, input_scale, etc.
             # These must NOT be caught by the substring-based weight handlers below.
             if name.endswith(("_scale", "_zero_point")):
@@ -614,7 +603,7 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
                     loaded_params.add(param_name)
                 continue
 
-            # === MHA attention: fused in_proj -> split and load via QKVParallelLinear ===
+            # MHA attention: fused in_proj -> split and load via QKVParallelLinear
             # LlamaDecoderLayer stores attention as self_attn.qkv_proj
             if ".mha.in_proj.weight" in name:
                 base_name = name.replace(".mha.in_proj.weight", "")
@@ -642,7 +631,7 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
                     loaded_params.add(param_name)
                 continue
 
-            # === MHA attention: out_proj rename (LlamaDecoderLayer uses self_attn.o_proj) ===
+            # MHA attention: out_proj rename (LlamaDecoderLayer uses self_attn.o_proj)
             if ".mha.out_proj." in name:
                 new_name = name.replace(".mha.out_proj.", ".self_attn.o_proj.")
                 if new_name not in params_dict:
@@ -663,7 +652,7 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
                     loaded_params.add(new_name)
                 continue
 
-            # === Mamba A_log -> A (weight_loader handles conversion + TP) ===
+            # Mamba A_log -> A (weight_loader handles conversion + TP)
             if ".mamba.A_log" in name:
                 new_name = name.replace(".mamba.A_log", ".mamba.A")
                 if new_name in params_dict:
@@ -675,7 +664,7 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
                     loaded_params.add(new_name)
                 continue
 
-            # === Mamba in_proj: load directly for Mamba2 (qwerky layout) ===
+            # Mamba in_proj: load directly for Mamba2 (qwerky layout)
             if ".mamba.in_proj.weight" in name:
                 param_name = name
                 if param_name not in params_dict:
@@ -699,7 +688,7 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
                     loaded_params.add(param_name)
                 continue
 
-            # === MLP: gate_proj -> gate_up_proj shard 0 ===
+            # MLP: gate_proj -> gate_up_proj shard 0
             if ".mlp.gate_proj.weight" in name:
                 param_name = name.replace(
                     ".mlp.gate_proj.weight", ".mlp.gate_up_proj.weight"
@@ -722,7 +711,7 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
                     loaded_params.add(param_name)
                 continue
 
-            # === MLP: up_proj -> gate_up_proj shard 1 ===
+            # MLP: up_proj -> gate_up_proj shard 1
             if ".mlp.up_proj.weight" in name:
                 param_name = name.replace(
                     ".mlp.up_proj.weight", ".mlp.gate_up_proj.weight"
@@ -745,7 +734,7 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
                     loaded_params.add(param_name)
                 continue
 
-            # === Default: use weight_loader if available ===
+            # Default: use weight_loader if available
             param_name = name
             if param_name not in params_dict:
                 # Try with/without model prefix
@@ -917,9 +906,7 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
         return True
 
 
-# =============================================================================
 # ALIASES FOR HF CONFIG COMPATIBILITY
-# =============================================================================
 # HuggingFace model configs specify "MambaInLlamaMambaForCausalLM" as the
 # architecture. This alias ensures vLLM can find and load the class.
 MambaInLlamaMambaForCausalLM = MambaInLlamaMambaForCausalLMNative
