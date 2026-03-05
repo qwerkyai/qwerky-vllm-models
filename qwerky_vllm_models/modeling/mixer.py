@@ -83,6 +83,7 @@ try:
         selective_scan_fn,
         selective_state_update,
     )
+
     _mamba_ops_available = True
 except ImportError:
     pass
@@ -101,22 +102,30 @@ except ImportError:
 # MambaMixer2 base class for Mamba2 hybrid layers
 _MambaMixer2 = None
 try:
-    from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2 as _MambaMixer2
+    from vllm.model_executor.layers.mamba.mamba_mixer2 import (
+        MambaMixer2 as _MambaMixer2,
+    )
 except ImportError:
     try:
-        from vllm.model_executor.layers.mamba.mamba2inllama_mixer import MambaMixer2 as _MambaMixer2
+        from vllm.model_executor.layers.mamba.mamba2inllama_mixer import (
+            MambaMixer2 as _MambaMixer2,
+        )
     except ImportError:
         pass
 
 _Mixer2RMSNormGated = None
 try:
-    from vllm.model_executor.layers.mamba.mamba_mixer2 import Mixer2RMSNormGated as _Mixer2RMSNormGated
+    from vllm.model_executor.layers.mamba.mamba_mixer2 import (
+        Mixer2RMSNormGated as _Mixer2RMSNormGated,
+    )
 except ImportError:
     pass
 
 _default_weight_loader = None
 try:
-    from vllm.model_executor.model_loader.weight_utils import default_weight_loader as _default_weight_loader
+    from vllm.model_executor.model_loader.weight_utils import (
+        default_weight_loader as _default_weight_loader,
+    )
 except ImportError:
     pass
 
@@ -126,6 +135,7 @@ except ImportError:
 # =============================================================================
 
 if _MambaBase is not None and _CustomOp is not None:
+
     @_CustomOp.register("mambainllama_mixer")
     class MambaInLlamaMambaMixer(_MambaBase, _CustomOp):
         """MambaInLlama Mamba mixer with vLLM V1 integration.
@@ -171,7 +181,9 @@ if _MambaBase is not None and _CustomOp is not None:
             self.num_heads = self.d_inner // self.d_state
             self.repeat_group = self.d_inner // self.d_xb
             self.num_C_head = self.num_heads
-            self.repeat_kv_before_conv = config.ssm_cfg.get("repeat_kv_before_conv", True)
+            self.repeat_kv_before_conv = config.ssm_cfg.get(
+                "repeat_kv_before_conv", True
+            )
             self.conv_dim = self.d_inner if self.repeat_kv_before_conv else self.d_xb
 
             # TP dimensions — per-partition sizes for forward split
@@ -221,9 +233,9 @@ if _MambaBase is not None and _CustomOp is not None:
                 tp_rank = get_tensor_model_parallel_rank()
                 tp_sz = get_tensor_model_parallel_world_size()
                 param.data.copy_(
-                    loaded_weight.data.split(
-                        loaded_weight.shape[0] // tp_sz, dim=0
-                    )[tp_rank]
+                    loaded_weight.data.split(loaded_weight.shape[0] // tp_sz, dim=0)[
+                        tp_rank
+                    ]
                 )
 
             def _A_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -256,8 +268,7 @@ if _MambaBase is not None and _CustomOp is not None:
 
             # Store cache config for prefix caching support
             self.mamba_block_size = (
-                cache_config.mamba_block_size
-                if cache_config is not None else 0
+                cache_config.mamba_block_size if cache_config is not None else 0
             )
 
             # Register in static_forward_context (unconditionally)
@@ -279,7 +290,9 @@ if _MambaBase is not None and _CustomOp is not None:
 
         def _precompute_static_tensors(self):
             """Precompute static tensor views/conversions once after weight loading."""
-            self._conv_weight = self.conv1d.weight.reshape(self.conv_dim_local, self.d_conv)
+            self._conv_weight = self.conv1d.weight.reshape(
+                self.conv_dim_local, self.d_conv
+            )
             self._D_float = self.D.float()
             self._dt_bias_float = self.dt_proj.bias.float()
             nheads = self.num_heads_local
@@ -301,8 +314,10 @@ if _MambaBase is not None and _CustomOp is not None:
             Convention: conv_state (d_conv-1, conv_dim), ssm_state (d_inner, d_state).
             """
             tp_size = get_tensor_model_parallel_world_size()
-            if (self.conv_dim == self.d_inner
-                    and _vllm_MambaStateShapeCalculator is not None):
+            if (
+                self.conv_dim == self.d_inner
+                and _vllm_MambaStateShapeCalculator is not None
+            ):
                 return _vllm_MambaStateShapeCalculator.mamba1_state_shape(
                     tp_world_size=tp_size,
                     intermediate_size=self.d_inner,
@@ -321,8 +336,11 @@ if _MambaBase is not None and _CustomOp is not None:
             can remain at model dtype (just a sliding window, no accumulation).
             Users can override via --mamba-ssm-cache-dtype.
             """
-            if (self.model_config is not None and self.cache_config is not None
-                    and _vllm_MambaStateDtypeCalculator is not None):
+            if (
+                self.model_config is not None
+                and self.cache_config is not None
+                and _vllm_MambaStateDtypeCalculator is not None
+            ):
                 # If user explicitly set mamba_ssm_cache_dtype, honor it.
                 # Otherwise, default SSM state to float32 for accuracy.
                 if self.cache_config.mamba_ssm_cache_dtype != "auto":
@@ -335,6 +353,7 @@ if _MambaBase is not None and _CustomOp is not None:
                 from vllm.model_executor.layers.mamba.mamba_utils import (
                     get_kv_cache_torch_dtype,
                 )
+
                 conv_dtype = get_kv_cache_torch_dtype(
                     self.cache_config.mamba_cache_dtype,
                     self.model_config.dtype,
@@ -382,7 +401,7 @@ if _MambaBase is not None and _CustomOp is not None:
                 # weights may not be loaded during early profiling)
                 num_tokens = hidden_states.shape[0]
                 output[:num_tokens] = self.out_proj(
-                    hidden_states[..., :self.d_inner_local]
+                    hidden_states[..., : self.d_inner_local]
                 )[0]
                 return
 
@@ -416,8 +435,10 @@ if _MambaBase is not None and _CustomOp is not None:
                 self.cache_config is not None
                 and self.cache_config.enable_prefix_caching
             )
-            if (prefix_caching_enabled
-                    and layer_metadata.block_idx_last_computed_token is not None):
+            if (
+                prefix_caching_enabled
+                and layer_metadata.block_idx_last_computed_token is not None
+            ):
                 block_idx_last_computed_token_d, block_idx_last_computed_token_p = (
                     torch.split(
                         layer_metadata.block_idx_last_computed_token,
@@ -458,8 +479,13 @@ if _MambaBase is not None and _CustomOp is not None:
 
             z, x, B, C, dt = torch.split(
                 zxbcdt,
-                [self.d_inner_local, self.d_xb_local, self.d_xb_local,
-                 self.d_inner_local, self.dt_rank_local],
+                [
+                    self.d_inner_local,
+                    self.d_xb_local,
+                    self.d_xb_local,
+                    self.d_inner_local,
+                    self.dt_rank_local,
+                ],
                 dim=-1,
             )
 
@@ -469,14 +495,18 @@ if _MambaBase is not None and _CustomOp is not None:
 
             # Expand x via expand (zero-copy stride-0 view + one reshape)
             if self.repeat_kv_before_conv:
-                x = x.view(-1, self.num_xb_head_local, 1, self.d_state) \
-                     .expand(-1, -1, self.repeat_group, -1) \
-                     .reshape(-1, self.d_inner_local)
+                x = (
+                    x.view(-1, self.num_xb_head_local, 1, self.d_state)
+                    .expand(-1, -1, self.repeat_group, -1)
+                    .reshape(-1, self.d_inner_local)
+                )
 
             # Expand B via expand (zero-copy stride-0 view + one reshape)
-            B = B.view(-1, self.num_xb_head_local, 1, self.d_state) \
-                 .expand(-1, -1, self.repeat_group, -1) \
-                 .reshape(-1, self.num_heads_local, self.d_state)
+            B = (
+                B.view(-1, self.num_xb_head_local, 1, self.d_state)
+                .expand(-1, -1, self.repeat_group, -1)
+                .reshape(-1, self.num_heads_local, self.d_state)
+            )
 
             # C is already d_inner_local, just reshape (direct view)
             C = C.view(-1, self.num_heads_local, self.d_state)
@@ -493,7 +523,9 @@ if _MambaBase is not None and _CustomOp is not None:
                 C_p = C[num_decode_tokens:num_actual_tokens]
                 dt_p = dt[num_decode_tokens:num_actual_tokens]
 
-                state_indices_p = state_indices[num_decode_tokens:num_decode_tokens + num_prefills]
+                state_indices_p = state_indices[
+                    num_decode_tokens : num_decode_tokens + num_prefills
+                ]
                 query_start_loc_p = layer_metadata.query_start_loc_p
                 has_initial_states_p = layer_metadata.has_initial_states_p
 
@@ -608,9 +640,7 @@ if _MambaBase is not None and _CustomOp is not None:
                 )
 
                 # Keep tokens-first: (num_decode, d_inner_local)
-                scan_outputs_d = scan_outputs_d.reshape(
-                    -1, self.d_inner_local
-                )
+                scan_outputs_d = scan_outputs_d.reshape(-1, self.d_inner_local)
 
                 ssm_outputs.insert(0, scan_outputs_d)  # decode comes first
 
@@ -618,7 +648,8 @@ if _MambaBase is not None and _CustomOp is not None:
             # All ssm_outputs are now (tokens, d_inner_local)
             # RowParallelLinear returns (output, bias) tuple
             y_combined = (
-                ssm_outputs[0] if len(ssm_outputs) == 1
+                ssm_outputs[0]
+                if len(ssm_outputs) == 1
                 else torch.cat(ssm_outputs, dim=0)
             )
             # Ensure contiguity: prefill path produces non-contiguous
@@ -657,7 +688,9 @@ else:
             self.num_heads = self.d_inner // self.d_state
             self.repeat_group = self.d_inner // self.d_xb
             self.num_C_head = self.num_heads
-            self.repeat_kv_before_conv = config.ssm_cfg.get("repeat_kv_before_conv", True)
+            self.repeat_kv_before_conv = config.ssm_cfg.get(
+                "repeat_kv_before_conv", True
+            )
             self.conv_dim = self.d_inner if self.repeat_kv_before_conv else self.d_xb
 
             self.in_proj = nn.Linear(
@@ -690,7 +723,10 @@ else:
 
             self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=False)
 
-            self.kv_cache: tuple[torch.Tensor, ...] = (torch.tensor([]), torch.tensor([]))
+            self.kv_cache: tuple[torch.Tensor, ...] = (
+                torch.tensor([]),
+                torch.tensor([]),
+            )
 
         def get_state_shape(self):
             conv_state_shape = (self.d_conv - 1, self.conv_dim)
@@ -738,7 +774,7 @@ else:
             y = rearrange(y, "b d l -> b l d")
             result = self.out_proj(y).squeeze(0)
             if output is not None:
-                output[:result.shape[0]] = result
+                output[: result.shape[0]] = result
             return result
 
 
@@ -746,6 +782,7 @@ else:
 # This is what makes the custom op pattern work — forward() calls the op,
 # the op looks up the layer by prefix and calls forward_cuda().
 if _vllm_available:
+
     def _mambainllama_mixer_op(
         hidden_states: torch.Tensor,
         output: torch.Tensor,
@@ -775,6 +812,7 @@ if _vllm_available:
 # =============================================================================
 
 if _MambaMixer2 is not None and _CustomOp is not None:
+
     @_CustomOp.register("mamba2inllama_mixer")
     class Mamba2InLlamaMambaMixer(_MambaMixer2):
         """MambaInLlama Mamba2 mixer adapted for qwerky-distill's weight layout.
@@ -864,12 +902,16 @@ if _MambaMixer2 is not None and _CustomOp is not None:
                 # Expand x and B: (tokens, d_xb_tp) → (tokens, d_inner_tp) via repeat.
                 # Each group of `state_size` values is repeated `repeat` times,
                 # matching the repeat_kv operation in qwerky-distill's forward pass.
-                x = x.reshape(*x.shape[:-1], -1, state_size).repeat_interleave(
-                    repeat, dim=-2
-                ).flatten(-2)
-                B = B.reshape(*B.shape[:-1], -1, state_size).repeat_interleave(
-                    repeat, dim=-2
-                ).flatten(-2)
+                x = (
+                    x.reshape(*x.shape[:-1], -1, state_size)
+                    .repeat_interleave(repeat, dim=-2)
+                    .flatten(-2)
+                )
+                B = (
+                    B.reshape(*B.shape[:-1], -1, state_size)
+                    .repeat_interleave(repeat, dim=-2)
+                    .flatten(-2)
+                )
                 return x, B, C
 
             self.split_hidden_states_B_C_fn = _qwerky_split
@@ -877,20 +919,28 @@ if _MambaMixer2 is not None and _CustomOp is not None:
             # Use direct (non-shard) weight loaders so the checkpoint weights are
             # stored in memory in qwerky's layout and our custom split_fn can handle them.
             if _default_weight_loader is not None:
-                for param in [self.in_proj.weight, self.conv1d.weight, self.conv1d.bias]:
+                for param in [
+                    self.in_proj.weight,
+                    self.conv1d.weight,
+                    self.conv1d.bias,
+                ]:
                     if hasattr(param, "weight_loader"):
                         delattr(param, "weight_loader")
                     set_weight_attrs(param, {"weight_loader": _default_weight_loader})
 
-        def forward(self, hidden_states: torch.Tensor, mup_vector: torch.Tensor | None = None):
+        def forward(
+            self, hidden_states: torch.Tensor, mup_vector: torch.Tensor | None = None
+        ):
             """Override to dispatch via mamba2inllama_mixer custom op."""
             projected_states, _ = self.in_proj(hidden_states)
             if mup_vector is not None:
                 projected_states = projected_states * mup_vector
 
             ssm_output = torch.empty(
-                [hidden_states.shape[0],
-                 (self.num_heads // self.tp_size) * self.head_dim],
+                [
+                    hidden_states.shape[0],
+                    (self.num_heads // self.tp_size) * self.head_dim,
+                ],
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
@@ -899,7 +949,7 @@ if _MambaMixer2 is not None and _CustomOp is not None:
                 projected_states, ssm_output, self.prefix
             )
 
-            gate = projected_states[..., :self.tped_intermediate_size]
+            gate = projected_states[..., : self.tped_intermediate_size]
             hidden_states = self.norm(ssm_output, gate)
             output, _ = self.out_proj(hidden_states)
             return output
@@ -927,6 +977,7 @@ else:
 
 # Register custom op for mamba2inllama_mixer
 if _vllm_available:
+
     def _mamba2inllama_mixer_op(
         projected_states: torch.Tensor,
         output: torch.Tensor,

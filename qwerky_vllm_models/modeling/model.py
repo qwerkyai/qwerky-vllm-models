@@ -21,7 +21,7 @@ Contains MambaInLlamaMambaModel (backbone) and MambaInLlamaMambaForCausalLMNativ
 import json
 import math
 import os
-from typing import ClassVar, Iterable, Literal, Optional, Tuple
+from typing import ClassVar, Iterable, Literal, Tuple
 
 import torch
 import torch.nn as nn
@@ -29,7 +29,7 @@ import torch.nn as nn
 from transformers.utils import logging
 
 from ..configuration import MambaInLlamaMambaConfig
-from .layers import MambaDecoderLayer, Mamba2DecoderLayer, MLP, RMSNorm
+from .layers import MambaDecoderLayer, Mamba2DecoderLayer, RMSNorm
 
 logger = logging.get_logger(__name__)
 
@@ -128,7 +128,9 @@ except ImportError:
 # support_torch_compile for torch.compile integration
 _support_torch_compile = None
 try:
-    from vllm.compilation.decorators import support_torch_compile as _support_torch_compile
+    from vllm.compilation.decorators import (
+        support_torch_compile as _support_torch_compile,
+    )
 except ImportError:
     pass
 
@@ -137,11 +139,17 @@ except ImportError:
 # MODEL BACKBONE
 # =============================================================================
 
+
 class MambaInLlamaMambaModel(nn.Module):
     """MambaInLlama Model backbone."""
 
-    def __init__(self, *, vllm_config: "VllmConfig", prefix: str = "",
-                 config: MambaInLlamaMambaConfig):
+    def __init__(
+        self,
+        *,
+        vllm_config: "VllmConfig",
+        prefix: str = "",
+        config: MambaInLlamaMambaConfig,
+    ):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
@@ -151,21 +159,27 @@ class MambaInLlamaMambaModel(nn.Module):
         # Extract cache_config, model_config, and quant_config from vllm_config
         cache_config = vllm_config.cache_config if vllm_config else None
         model_config = vllm_config.model_config if vllm_config else None
-        quant_config = getattr(vllm_config, 'quant_config', None) if vllm_config else None
+        quant_config = (
+            getattr(vllm_config, "quant_config", None) if vllm_config else None
+        )
 
         # Register splitting ops so torch.compile doesn't try to compile our custom ops
-        is_mamba2 = getattr(config, 'mamba_version', 'Mamba1') == 'Mamba2'
+        is_mamba2 = getattr(config, "mamba_version", "Mamba1") == "Mamba2"
         if vllm_config is not None:
             compilation_config = vllm_config.compilation_config
             if is_mamba2:
                 op_name = "vllm::mamba2inllama_mixer"
             else:
                 op_name = "vllm::mambainllama_mixer"
-            if (compilation_config.splitting_ops is not None
-                    and op_name not in compilation_config.splitting_ops):
+            if (
+                compilation_config.splitting_ops is not None
+                and op_name not in compilation_config.splitting_ops
+            ):
                 compilation_config.splitting_ops.append(op_name)
 
-        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size, config.hidden_size
+        )
 
         self.layers = nn.ModuleList()
         if config.attn_layers and _LlamaDecoderLayer is None:
@@ -174,24 +188,40 @@ class MambaInLlamaMambaModel(nn.Module):
                 "Attention layers require vLLM >= 0.14.0."
             )
         for layer_idx in range(config.num_hidden_layers):
-            layer_prefix = f"{prefix}.layers.{layer_idx}" if prefix else f"model.layers.{layer_idx}"
+            layer_prefix = (
+                f"{prefix}.layers.{layer_idx}"
+                if prefix
+                else f"model.layers.{layer_idx}"
+            )
             if layer_idx in config.attn_layers:
-                self.layers.append(_LlamaDecoderLayer(
-                    vllm_config=vllm_config,
-                    prefix=layer_prefix,
-                ))
+                self.layers.append(
+                    _LlamaDecoderLayer(
+                        vllm_config=vllm_config,
+                        prefix=layer_prefix,
+                    )
+                )
             elif is_mamba2:
-                self.layers.append(Mamba2DecoderLayer(
-                    config, layer_idx, prefix=layer_prefix,
-                    model_config=model_config, cache_config=cache_config,
-                    quant_config=quant_config,
-                ))
+                self.layers.append(
+                    Mamba2DecoderLayer(
+                        config,
+                        layer_idx,
+                        prefix=layer_prefix,
+                        model_config=model_config,
+                        cache_config=cache_config,
+                        quant_config=quant_config,
+                    )
+                )
             else:
-                self.layers.append(MambaDecoderLayer(
-                    config, layer_idx, prefix=layer_prefix,
-                    model_config=model_config, cache_config=cache_config,
-                    quant_config=quant_config,
-                ))
+                self.layers.append(
+                    MambaDecoderLayer(
+                        config,
+                        layer_idx,
+                        prefix=layer_prefix,
+                        model_config=model_config,
+                        cache_config=cache_config,
+                        quant_config=quant_config,
+                    )
+                )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -281,7 +311,9 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
                     intermediate_size=intermediate_size,
                     rms_norm_eps=getattr(hf_cfg, "rms_norm_eps", 1e-6),
                     rope_theta=getattr(hf_cfg, "rope_theta", 10000.0),
-                    max_position_embeddings=getattr(hf_cfg, "max_position_embeddings", 2048),
+                    max_position_embeddings=getattr(
+                        hf_cfg, "max_position_embeddings", 2048
+                    ),
                     rope_scaling=getattr(hf_cfg, "rope_scaling", None),
                 )
 
@@ -290,10 +322,13 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
                 mamba_cfg = {}
                 if hasattr(model_config, "model") and model_config.model:
                     model_path = model_config.model
-                    logger.info(f"Looking for mamba_config.json for model: {model_path}")
+                    logger.info(
+                        f"Looking for mamba_config.json for model: {model_path}"
+                    )
                     # Handle HuggingFace hub models
                     try:
                         from huggingface_hub import hf_hub_download
+
                         # Try to download mamba_config.json (will use cache if available)
                         try:
                             mamba_config_path = hf_hub_download(
@@ -301,15 +336,21 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
                             )
                             with open(mamba_config_path, "r") as f:
                                 mamba_cfg = json.load(f)
-                                logger.info(f"Loaded mamba_config.json from {mamba_config_path}")
-                                logger.info(f"mamba_config contents: attn_layers={mamba_cfg.get('attn_layers')}, d_inner={mamba_cfg.get('d_inner')}, d_xb={mamba_cfg.get('d_xb')}")
+                                logger.info(
+                                    f"Loaded mamba_config.json from {mamba_config_path}"
+                                )
+                                logger.info(
+                                    f"mamba_config contents: attn_layers={mamba_cfg.get('attn_layers')}, d_inner={mamba_cfg.get('d_inner')}, d_xb={mamba_cfg.get('d_xb')}"
+                                )
                         except Exception as e:
                             logger.warning(f"Could not load mamba_config.json: {e}")
                             # Try local path as fallback
                             mamba_cfg = _load_mamba_config(model_path)
                     except ImportError:
                         # huggingface_hub not available, try local path
-                        logger.warning("huggingface_hub not available, trying local path")
+                        logger.warning(
+                            "huggingface_hub not available, trying local path"
+                        )
                         mamba_cfg = _load_mamba_config(model_path)
 
                 # Try to get attn_layers from various possible locations
@@ -319,21 +360,32 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
                 # First check mamba_config.json
                 if mamba_cfg.get("attn_layers"):
                     attn_layers = mamba_cfg["attn_layers"]
-                    logger.info(f"Found attn_layers from mamba_config.json: {attn_layers}")
+                    logger.info(
+                        f"Found attn_layers from mamba_config.json: {attn_layers}"
+                    )
                 # Then check HF config
                 elif hasattr(hf_cfg, "attn_layers") and hf_cfg.attn_layers is not None:
                     attn_layers = hf_cfg.attn_layers
-                elif hasattr(hf_cfg, "attention_layers") and hf_cfg.attention_layers is not None:
+                elif (
+                    hasattr(hf_cfg, "attention_layers")
+                    and hf_cfg.attention_layers is not None
+                ):
                     attn_layers = hf_cfg.attention_layers
                 elif hasattr(hf_cfg, "ssm_cfg") and isinstance(hf_cfg.ssm_cfg, dict):
-                    attn_layers = hf_cfg.ssm_cfg.get("attn_layers") or hf_cfg.ssm_cfg.get("attention_layers")
+                    attn_layers = hf_cfg.ssm_cfg.get(
+                        "attn_layers"
+                    ) or hf_cfg.ssm_cfg.get("attention_layers")
 
                 if attn_layers:
                     config_kwargs["attn_layers"] = attn_layers
                     logger.info(f"Using attn_layers: {attn_layers}")
                 else:
-                    logger.warning(f"No attn_layers found! Model will use ALL Mamba layers (no attention).")
-                    logger.warning(f"HF config attrs: {[a for a in dir(hf_cfg) if not a.startswith('_')]}")
+                    logger.warning(
+                        "No attn_layers found! Model will use ALL Mamba layers (no attention)."
+                    )
+                    logger.warning(
+                        f"HF config attrs: {[a for a in dir(hf_cfg) if not a.startswith('_')]}"
+                    )
 
                 # Get Mamba dimensions - priority: mamba_config.json > hf_config
                 if mamba_cfg.get("d_model"):
@@ -357,9 +409,8 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
                     config_kwargs["ssm_cfg"] = hf_cfg.ssm_cfg
 
                 # Mamba 2 parameters — priority: mamba_config.json > hf_config
-                mamba_version = (
-                    mamba_cfg.get("mamba_version")
-                    or getattr(hf_cfg, "mamba_version", None)
+                mamba_version = mamba_cfg.get("mamba_version") or getattr(
+                    hf_cfg, "mamba_version", None
                 )
                 if mamba_version:
                     config_kwargs["mamba_version"] = mamba_version
@@ -374,9 +425,13 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
                 if mamba_cfg.get("d_conv"):
                     config_kwargs["d_conv"] = mamba_cfg["d_conv"]
                 if mamba_cfg.get("mamba_intermediate_size"):
-                    config_kwargs["mamba_intermediate_size"] = mamba_cfg["mamba_intermediate_size"]
+                    config_kwargs["mamba_intermediate_size"] = mamba_cfg[
+                        "mamba_intermediate_size"
+                    ]
 
-                logger.info(f"Final config_kwargs: d_inner={config_kwargs.get('d_inner')}, d_xb={config_kwargs.get('d_xb')}, attn_layers={config_kwargs.get('attn_layers')}, mamba_version={config_kwargs.get('mamba_version', 'Mamba1')}")
+                logger.info(
+                    f"Final config_kwargs: d_inner={config_kwargs.get('d_inner')}, d_xb={config_kwargs.get('d_xb')}, attn_layers={config_kwargs.get('attn_layers')}, mamba_version={config_kwargs.get('mamba_version', 'Mamba1')}"
+                )
                 config = MambaInLlamaMambaConfig(**config_kwargs)
 
         if config is None:
@@ -389,7 +444,9 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
         # Pass vllm_config to model backbone (extracts cache_config/model_config internally)
         model_prefix = f"{prefix}.model" if prefix else "model"
         self.model = MambaInLlamaMambaModel(
-            vllm_config=vllm_config, config=config, prefix=model_prefix,
+            vllm_config=vllm_config,
+            config=config,
+            prefix=model_prefix,
         )
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, bias=False)
 
@@ -399,12 +456,12 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
         if _vllm_available:
             try:
                 self._vllm_logits_processor = LogitsProcessor(config.vocab_size)
-            except:
+            except Exception:
                 pass
         if _vllm_Sampler is not None:
             try:
                 self._vllm_sampler = _vllm_Sampler()
-            except:
+            except Exception:
                 pass
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -462,15 +519,24 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
         loaded_params: set[str] = set()
 
         # Mamba in_proj shard sizes depend on Mamba version
-        is_mamba2 = getattr(self.config, 'mamba_version', 'Mamba1') == 'Mamba2'
+        is_mamba2 = getattr(self.config, "mamba_version", "Mamba1") == "Mamba2"
         if is_mamba2:
-            m2_intermediate = getattr(self.config, 'mamba_intermediate_size', None) or self.config.d_model
-            m2_n_groups = getattr(self.config, 'mamba_n_groups', 1)
-            m2_ssm_state = getattr(self.config, 'ssm_state_size', 64)
-            m2_num_heads = getattr(self.config, 'mamba_num_heads', 128)
+            m2_intermediate = (
+                getattr(self.config, "mamba_intermediate_size", None)
+                or self.config.d_model
+            )
+            m2_n_groups = getattr(self.config, "mamba_n_groups", 1)
+            m2_ssm_state = getattr(self.config, "ssm_state_size", 64)
+            m2_num_heads = getattr(self.config, "mamba_num_heads", 128)
             groups_ssm_state_size = m2_n_groups * m2_ssm_state
             # Mamba 2 in_proj: [gate, x, B, C, dt]
-            mamba_in_proj_sizes = [m2_intermediate, m2_intermediate, groups_ssm_state_size, groups_ssm_state_size, m2_num_heads]
+            mamba_in_proj_sizes = [
+                m2_intermediate,
+                m2_intermediate,
+                groups_ssm_state_size,
+                groups_ssm_state_size,
+                m2_num_heads,
+            ]
         else:
             # Mamba 1 in_proj: [z, x, B, C, dt]
             d_inner = self.config.d_inner
@@ -494,14 +560,22 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
                 param_name = name
                 shard_id = None
                 if ".mha.in_proj." in param_name:
-                    param_name = param_name.replace(".mha.in_proj.", ".self_attn.qkv_proj.")
+                    param_name = param_name.replace(
+                        ".mha.in_proj.", ".self_attn.qkv_proj."
+                    )
                 elif ".mha.out_proj." in param_name:
-                    param_name = param_name.replace(".mha.out_proj.", ".self_attn.o_proj.")
+                    param_name = param_name.replace(
+                        ".mha.out_proj.", ".self_attn.o_proj."
+                    )
                 elif ".mlp.gate_proj." in param_name:
-                    param_name = param_name.replace(".mlp.gate_proj.", ".mlp.gate_up_proj.")
+                    param_name = param_name.replace(
+                        ".mlp.gate_proj.", ".mlp.gate_up_proj."
+                    )
                     shard_id = 0
                 elif ".mlp.up_proj." in param_name:
-                    param_name = param_name.replace(".mlp.up_proj.", ".mlp.gate_up_proj.")
+                    param_name = param_name.replace(
+                        ".mlp.up_proj.", ".mlp.gate_up_proj."
+                    )
                     shard_id = 1
                 if param_name not in params_dict:
                     if param_name.startswith("model."):
@@ -510,8 +584,9 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
                         param_name = f"model.{param_name}"
                 if param_name in params_dict:
                     param = params_dict[param_name]
-                    weight_loader = getattr(param, "weight_loader",
-                                            default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     if shard_id is not None:
                         weight_loader(param, loaded_weight, shard_id)
                     else:
@@ -524,18 +599,23 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
             if ".mha.in_proj.weight" in name:
                 base_name = name.replace(".mha.in_proj.weight", "")
                 q_weight = loaded_weight[:q_dim, :]
-                k_weight = loaded_weight[q_dim:q_dim + kv_dim, :]
-                v_weight = loaded_weight[q_dim + kv_dim:, :]
+                k_weight = loaded_weight[q_dim : q_dim + kv_dim, :]
+                v_weight = loaded_weight[q_dim + kv_dim :, :]
                 param_name = base_name + ".self_attn.qkv_proj.weight"
                 if param_name not in params_dict:
                     if name.startswith("model."):
-                        param_name = name[6:].replace(".mha.in_proj.weight", ".self_attn.qkv_proj.weight")
+                        param_name = name[6:].replace(
+                            ".mha.in_proj.weight", ".self_attn.qkv_proj.weight"
+                        )
                     else:
-                        param_name = f"model.{name}".replace(".mha.in_proj.weight", ".self_attn.qkv_proj.weight")
+                        param_name = f"model.{name}".replace(
+                            ".mha.in_proj.weight", ".self_attn.qkv_proj.weight"
+                        )
                 if param_name in params_dict:
                     param = params_dict[param_name]
-                    weight_loader = getattr(param, "weight_loader",
-                                            default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     weight_loader(param, q_weight, "q")
                     weight_loader(param, k_weight, "k")
                     weight_loader(param, v_weight, "v")
@@ -547,13 +627,18 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
                 new_name = name.replace(".mha.out_proj.", ".self_attn.o_proj.")
                 if new_name not in params_dict:
                     if name.startswith("model."):
-                        new_name = name[6:].replace(".mha.out_proj.", ".self_attn.o_proj.")
+                        new_name = name[6:].replace(
+                            ".mha.out_proj.", ".self_attn.o_proj."
+                        )
                     else:
-                        new_name = f"model.{name}".replace(".mha.out_proj.", ".self_attn.o_proj.")
+                        new_name = f"model.{name}".replace(
+                            ".mha.out_proj.", ".self_attn.o_proj."
+                        )
                 if new_name in params_dict:
                     param = params_dict[new_name]
-                    weight_loader = getattr(param, "weight_loader",
-                                            default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     weight_loader(param, loaded_weight)
                     loaded_params.add(new_name)
                 continue
@@ -563,8 +648,9 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
                 new_name = name.replace(".mamba.A_log", ".mamba.A")
                 if new_name in params_dict:
                     param = params_dict[new_name]
-                    weight_loader = getattr(param, "weight_loader",
-                                            default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     weight_loader(param, loaded_weight)
                     loaded_params.add(new_name)
                 continue
@@ -573,11 +659,14 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
             if ".mamba.in_proj.weight" in name:
                 param_name = name
                 if param_name not in params_dict:
-                    param_name = f"model.{name}" if not name.startswith("model.") else name[6:]
+                    param_name = (
+                        f"model.{name}" if not name.startswith("model.") else name[6:]
+                    )
                 if param_name in params_dict:
                     param = params_dict[param_name]
-                    weight_loader = getattr(param, "weight_loader",
-                                            default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     if is_mamba2:
                         # QwerkyMamba2Mixer stores weights in qwerky's layout
                         # [z, x, B, C, dt]; load the full matrix directly.
@@ -592,38 +681,46 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
 
             # === MLP: gate_proj -> gate_up_proj shard 0 ===
             if ".mlp.gate_proj.weight" in name:
-                param_name = name.replace(".mlp.gate_proj.weight",
-                                          ".mlp.gate_up_proj.weight")
+                param_name = name.replace(
+                    ".mlp.gate_proj.weight", ".mlp.gate_up_proj.weight"
+                )
                 if param_name not in params_dict:
                     if name.startswith("model."):
-                        param_name = name[6:].replace(".mlp.gate_proj.weight",
-                                                      ".mlp.gate_up_proj.weight")
+                        param_name = name[6:].replace(
+                            ".mlp.gate_proj.weight", ".mlp.gate_up_proj.weight"
+                        )
                     else:
-                        param_name = f"model.{name}".replace(".mlp.gate_proj.weight",
-                                                             ".mlp.gate_up_proj.weight")
+                        param_name = f"model.{name}".replace(
+                            ".mlp.gate_proj.weight", ".mlp.gate_up_proj.weight"
+                        )
                 if param_name in params_dict:
                     param = params_dict[param_name]
-                    weight_loader = getattr(param, "weight_loader",
-                                            default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     weight_loader(param, loaded_weight, 0)
                     loaded_params.add(param_name)
                 continue
 
             # === MLP: up_proj -> gate_up_proj shard 1 ===
             if ".mlp.up_proj.weight" in name:
-                param_name = name.replace(".mlp.up_proj.weight",
-                                          ".mlp.gate_up_proj.weight")
+                param_name = name.replace(
+                    ".mlp.up_proj.weight", ".mlp.gate_up_proj.weight"
+                )
                 if param_name not in params_dict:
                     if name.startswith("model."):
-                        param_name = name[6:].replace(".mlp.up_proj.weight",
-                                                      ".mlp.gate_up_proj.weight")
+                        param_name = name[6:].replace(
+                            ".mlp.up_proj.weight", ".mlp.gate_up_proj.weight"
+                        )
                     else:
-                        param_name = f"model.{name}".replace(".mlp.up_proj.weight",
-                                                             ".mlp.gate_up_proj.weight")
+                        param_name = f"model.{name}".replace(
+                            ".mlp.up_proj.weight", ".mlp.gate_up_proj.weight"
+                        )
                 if param_name in params_dict:
                     param = params_dict[param_name]
-                    weight_loader = getattr(param, "weight_loader",
-                                            default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     weight_loader(param, loaded_weight, 1)
                     loaded_params.add(param_name)
                 continue
@@ -639,8 +736,7 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
 
             if param_name in params_dict:
                 param = params_dict[param_name]
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 loaded_params.add(param_name)
 
@@ -659,44 +755,47 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
 
         hf_config = vllm_config.model_config.hf_config
         parallel_config = vllm_config.parallel_config
-        mamba_version = getattr(hf_config, 'mamba_version', 'Mamba1')
+        mamba_version = getattr(hf_config, "mamba_version", "Mamba1")
 
-        if mamba_version == 'Mamba2':
+        if mamba_version == "Mamba2":
             # config.json typically uses model_type="llama" so hf_config won't have
             # Mamba2-specific fields. Load them from mamba_config.json directly.
             mamba_cfg = {}
-            model_path = getattr(vllm_config.model_config, 'model', '')
+            model_path = getattr(vllm_config.model_config, "model", "")
             if model_path:
                 try:
                     from huggingface_hub import hf_hub_download
+
                     mamba_config_path = hf_hub_download(model_path, "mamba_config.json")
                     with open(mamba_config_path, "r") as f:
                         mamba_cfg = json.load(f)
                 except Exception:
                     mamba_cfg = _load_mamba_config(model_path)
 
-            num_heads = (mamba_cfg.get("num_heads")
-                         or getattr(hf_config, 'mamba_num_heads', 128))
-            head_dim = (mamba_cfg.get("head_dim")
-                        or getattr(hf_config, 'mamba_head_dim', 64))
-            ssm_state_size = (mamba_cfg.get("ssm_state_size")
-                              or getattr(hf_config, 'ssm_state_size', 64))
-            d_conv = (mamba_cfg.get("d_conv")
-                      or getattr(hf_config, 'd_conv', 4))
-            d_xb = (mamba_cfg.get("d_xb")
-                    or getattr(hf_config, 'd_xb', None))
+            num_heads = mamba_cfg.get("num_heads") or getattr(
+                hf_config, "mamba_num_heads", 128
+            )
+            head_dim = mamba_cfg.get("head_dim") or getattr(
+                hf_config, "mamba_head_dim", 64
+            )
+            ssm_state_size = mamba_cfg.get("ssm_state_size") or getattr(
+                hf_config, "ssm_state_size", 64
+            )
+            d_conv = mamba_cfg.get("d_conv") or getattr(hf_config, "d_conv", 4)
+            d_xb = mamba_cfg.get("d_xb") or getattr(hf_config, "d_xb", None)
             intermediate_size = (
                 mamba_cfg.get("mamba_intermediate_size")
                 or mamba_cfg.get("d_inner")
-                or getattr(hf_config, 'mamba_intermediate_size', None)
+                or getattr(hf_config, "mamba_intermediate_size", None)
                 or hf_config.hidden_size
             )
             # n_groups for conv_dim: use d_xb // ssm_state_size (qwerky-distill layout)
             if d_xb:
                 n_groups_conv = d_xb // ssm_state_size
             else:
-                n_groups_conv = (mamba_cfg.get("n_groups")
-                                 or getattr(hf_config, 'mamba_n_groups', 1))
+                n_groups_conv = mamba_cfg.get("n_groups") or getattr(
+                    hf_config, "mamba_n_groups", 1
+                )
 
             return _vllm_MambaStateShapeCalculator.mamba2_state_shape(
                 tp_world_size=parallel_config.tensor_parallel_size,
@@ -732,9 +831,9 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
 
         hf_config = vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
-        mamba_version = getattr(hf_config, 'mamba_version', 'Mamba1')
+        mamba_version = getattr(hf_config, "mamba_version", "Mamba1")
 
-        if mamba_version == 'Mamba2':
+        if mamba_version == "Mamba2":
             return _vllm_MambaStateDtypeCalculator.mamba2_state_dtype(
                 vllm_config.model_config.dtype,
                 cache_config.mamba_cache_dtype,
@@ -750,6 +849,7 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
         from vllm.model_executor.layers.mamba.mamba_utils import (
             get_kv_cache_torch_dtype,
         )
+
         conv_dtype = get_kv_cache_torch_dtype(
             cache_config.mamba_cache_dtype,
             vllm_config.model_config.dtype,

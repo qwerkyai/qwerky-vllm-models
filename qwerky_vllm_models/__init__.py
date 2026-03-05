@@ -65,17 +65,24 @@ def register():
 
     # Log environment versions for debugging across machines
     import logging
+
     logger = logging.getLogger(__name__)
     try:
         import vllm
         import torch
         import transformers
+
         logger.info(
             "qwerky-vllm-models==%s, vllm==%s, torch==%s, transformers==%s",
-            __version__, vllm.__version__, torch.__version__, transformers.__version__,
+            __version__,
+            vllm.__version__,
+            torch.__version__,
+            transformers.__version__,
         )
     except ImportError:
-        logger.info("qwerky-vllm-models==%s (some dependencies not yet installed)", __version__)
+        logger.info(
+            "qwerky-vllm-models==%s (some dependencies not yet installed)", __version__
+        )
 
     # Then register with vLLM
     try:
@@ -105,7 +112,7 @@ def register():
         try:
             ModelRegistry.register_model(
                 "MambaInLlamaMambaForCausalLM",
-                "qwerky_vllm_models.modeling:MambaInLlamaMambaForCausalLM"
+                "qwerky_vllm_models.modeling:MambaInLlamaMambaForCausalLM",
             )
         except Exception:
             pass
@@ -114,7 +121,7 @@ def register():
         try:
             ModelRegistry.register_model(
                 "MambaInLlamaMambaForCausalLMNative",
-                "qwerky_vllm_models.modeling:MambaInLlamaMambaForCausalLMNative"
+                "qwerky_vllm_models.modeling:MambaInLlamaMambaForCausalLMNative",
             )
         except Exception:
             pass
@@ -123,7 +130,7 @@ def register():
         try:
             ModelRegistry.register_model(
                 "QwerkyLlamaMambaHybridForCausalLM",
-                "qwerky_vllm_models.modeling:QwerkyLlamaMambaHybridForCausalLM"
+                "qwerky_vllm_models.modeling:QwerkyLlamaMambaHybridForCausalLM",
             )
         except Exception:
             pass
@@ -132,7 +139,7 @@ def register():
         try:
             ModelRegistry.register_model(
                 "QwerkyMamba2HybridForCausalLM",
-                "qwerky_vllm_models.modeling:QwerkyMamba2HybridForCausalLM"
+                "qwerky_vllm_models.modeling:QwerkyMamba2HybridForCausalLM",
             )
         except Exception:
             pass
@@ -147,6 +154,7 @@ def get_model_classes():
         QwerkyLlamaMambaHybridForCausalLM,
         QwerkyMamba2HybridForCausalLM,
     )
+
     return {
         "MambaInLlamaMambaForCausalLM": MambaInLlamaMambaForCausalLM,
         "MambaInLlamaMambaForCausalLMNative": MambaInLlamaMambaForCausalLMNative,
