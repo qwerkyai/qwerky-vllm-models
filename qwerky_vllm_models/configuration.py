@@ -100,8 +100,11 @@ class MambaInLlamaMambaConfig(PretrainedConfig):
         # Mamba 2 parameters (used when mamba_version == "Mamba2")
         mamba_version: str = "Mamba1",
         mamba_n_groups: Optional[int] = None,
+        n_groups: Optional[int] = None,  # alias from mamba_config.json
         mamba_num_heads: Optional[int] = None,
+        num_heads: Optional[int] = None,  # alias from mamba_config.json
         mamba_head_dim: Optional[int] = None,
+        head_dim: Optional[int] = None,  # alias from mamba_config.json
         ssm_state_size: Optional[int] = None,
         d_conv: int = 4,
         mamba_intermediate_size: Optional[int] = None,
@@ -138,11 +141,13 @@ class MambaInLlamaMambaConfig(PretrainedConfig):
         self.ssm_cfg = ssm_cfg if ssm_cfg is not None else {}
         self.attn_layers = attn_layers if attn_layers is not None else []
 
-        # Mamba 2 parameters
+        # Mamba 2 parameters (accept both mamba_* prefix and bare names from mamba_config.json)
         self.mamba_version = mamba_version
-        self.mamba_n_groups = mamba_n_groups
-        self.mamba_num_heads = mamba_num_heads
-        self.mamba_head_dim = mamba_head_dim
+        self.mamba_n_groups = mamba_n_groups if mamba_n_groups is not None else n_groups
+        self.mamba_num_heads = (
+            mamba_num_heads if mamba_num_heads is not None else num_heads
+        )
+        self.mamba_head_dim = mamba_head_dim if mamba_head_dim is not None else head_dim
         self.ssm_state_size = ssm_state_size
         self.d_conv = d_conv
         self.mamba_intermediate_size = mamba_intermediate_size
