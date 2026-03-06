@@ -45,7 +45,7 @@ def _resolve_model_dir(model_config) -> Optional[str]:
     try:
         return snapshot_download(model, local_files_only=True)
     except Exception:
-        pass
+        logger.warning("Failed to resolve model dir for %r from HuggingFace Hub", model, exc_info=True)
     return None
 
 
@@ -76,50 +76,16 @@ def _checkpoint_has_key(model_config, key: str) -> bool:
             with safe_open(st_path, framework="pt", device="cpu") as f:
                 return key in f.keys()
     except Exception:
-        pass
+        logger.warning("Failed to probe checkpoint for key %r, assuming present", key, exc_info=True)
     return True  # safe default
 
 
-# vLLM imports
-_vllm_available = False
-RMSNorm = None
-
-try:
-    from vllm.model_executor.layers.layernorm import RMSNorm
-    from vllm.model_executor.layers.linear import (
-        MergedColumnParallelLinear,
-        RowParallelLinear,
-    )
-    from vllm.model_executor.layers.activation import SiluAndMul
-
-    _vllm_available = True
-except ImportError:
-    pass
-
-
-class RMSNormFallback(nn.Module):
-    """RMSNorm fallback."""
-
-    def __init__(self, hidden_size: int, eps: float = 1e-6, **kwargs):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.eps = eps
-
-    def forward(self, x, residual=None):
-        if residual is not None:
-            x = x + residual
-            residual = x
-        input_dtype = x.dtype
-        x = x.to(torch.float32)
-        variance = x.pow(2).mean(-1, keepdim=True)
-        x = self.weight * (x * torch.rsqrt(variance + self.eps)).to(input_dtype)
-        if residual is not None:
-            return x, residual
-        return x
-
-
-if RMSNorm is None:
-    RMSNorm = RMSNormFallback
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    RowParallelLinear,
+)
+from vllm.model_executor.layers.activation import SiluAndMul
 
 
 class MLP(nn.Module):
@@ -135,38 +101,28 @@ class MLP(nn.Module):
     ):
         super().__init__()
         self.intermediate_size = intermediate_size
-        if _vllm_available:
-            self.gate_up_proj = MergedColumnParallelLinear(
-                d_model,
-                [intermediate_size, intermediate_size],
-                bias=False,
-                prefix=f"{prefix}.gate_up_proj" if prefix else "gate_up_proj",
-                quant_config=quant_config,
-            )
-            self.down_proj = RowParallelLinear(
-                intermediate_size,
-                d_model,
-                bias=False,
-                input_is_parallel=True,
-                prefix=f"{prefix}.down_proj" if prefix else "down_proj",
-                quant_config=quant_config,
-            )
-            self.act_fn = SiluAndMul()
-            self._use_fused = True
-        else:
-            self.gate_proj = nn.Linear(d_model, intermediate_size, bias=False)
-            self.up_proj = nn.Linear(d_model, intermediate_size, bias=False)
-            self.down_proj = nn.Linear(intermediate_size, d_model, bias=False)
-            self.act_fn = nn.SiLU() if hidden_act == "silu" else nn.GELU()
-            self._use_fused = False
+        self.gate_up_proj = MergedColumnParallelLinear(
+            d_model,
+            [intermediate_size, intermediate_size],
+            bias=False,
+            prefix=f"{prefix}.gate_up_proj" if prefix else "gate_up_proj",
+            quant_config=quant_config,
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            d_model,
+            bias=False,
+            input_is_parallel=True,
+            prefix=f"{prefix}.down_proj" if prefix else "down_proj",
+            quant_config=quant_config,
+        )
+        self.act_fn = SiluAndMul()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self._use_fused:
-            x, _ = self.gate_up_proj(x)
-            x = self.act_fn(x)
-            x, _ = self.down_proj(x)
-            return x
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        x, _ = self.gate_up_proj(x)
+        x = self.act_fn(x)
+        x, _ = self.down_proj(x)
+        return x
 
 
 class MambaDecoderLayer(nn.Module):

@@ -65,71 +65,30 @@ def _load_mamba_config(model_path: str) -> dict:
     return mamba_config
 
 
-# vLLM imports
-_vllm_available = False
-
-try:
-    from vllm.model_executor.layers.vocab_parallel_embedding import (
-        VocabParallelEmbedding,
-        ParallelLMHead,
-    )
-    from vllm.model_executor.layers.logits_processor import LogitsProcessor
-    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-    from vllm.config import VllmConfig
-
-    _vllm_available = True
-except ImportError as e:
-    logger.warning(f"vLLM not available: {e}")
-
-# LlamaDecoderLayer import for MHA layers
-_LlamaDecoderLayer = None
-try:
-    from vllm.model_executor.models.llama import LlamaDecoderLayer as _LlamaDecoderLayer
-except ImportError:
-    pass
-
-# Try to import Sampler (location varies by vLLM version)
-_vllm_Sampler = None
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+    ParallelLMHead,
+)
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.config import VllmConfig
+from vllm.model_executor.models.llama import LlamaDecoderLayer as _LlamaDecoderLayer
 try:
     from vllm.model_executor.layers.sampler import Sampler as _vllm_Sampler
 except ImportError:
-    try:
-        from vllm.v1.sample.sampler import Sampler as _vllm_Sampler
-    except ImportError:
-        pass
-
-# Try to import protocol interfaces for model registration
-_HasInnerState = None
-_IsHybrid = None
-_SupportsMambaPrefixCaching = None
-try:
-    from vllm.model_executor.models.interfaces import HasInnerState as _HasInnerState
-    from vllm.model_executor.models.interfaces import IsHybrid as _IsHybrid
-    from vllm.model_executor.models.interfaces import (
-        SupportsMambaPrefixCaching as _SupportsMambaPrefixCaching,
-    )
-except ImportError:
-    pass
-
-# State calculators (for class methods)
-_vllm_MambaStateShapeCalculator = None
-_vllm_MambaStateDtypeCalculator = None
-try:
-    from vllm.model_executor.layers.mamba.mamba_utils import (
-        MambaStateShapeCalculator as _vllm_MambaStateShapeCalculator,
-        MambaStateDtypeCalculator as _vllm_MambaStateDtypeCalculator,
-    )
-except ImportError:
-    pass
-
-# support_torch_compile for torch.compile integration
-_support_torch_compile = None
-try:
-    from vllm.compilation.decorators import (
-        support_torch_compile as _support_torch_compile,
-    )
-except ImportError:
-    pass
+    from vllm.v1.sample.sampler import Sampler as _vllm_Sampler
+from vllm.model_executor.models.interfaces import HasInnerState as _HasInnerState
+from vllm.model_executor.models.interfaces import IsHybrid as _IsHybrid
+from vllm.model_executor.models.interfaces import (
+    SupportsMambaPrefixCaching as _SupportsMambaPrefixCaching,
+)
+from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateShapeCalculator as _vllm_MambaStateShapeCalculator,
+    MambaStateDtypeCalculator as _vllm_MambaStateDtypeCalculator,
+)
+from vllm.compilation.decorators import (
+    support_torch_compile as _support_torch_compile,
+)
 
 
 class MambaInLlamaMambaModel(nn.Module):
@@ -174,11 +133,6 @@ class MambaInLlamaMambaModel(nn.Module):
         )
 
         self.layers = nn.ModuleList()
-        if config.attn_layers and _LlamaDecoderLayer is None:
-            raise RuntimeError(
-                "LlamaDecoderLayer could not be imported from vllm.model_executor.models.llama. "
-                "Attention layers require vLLM >= 0.14.0."
-            )
         for layer_idx in range(config.num_hidden_layers):
             layer_prefix = (
                 f"{prefix}.layers.{layer_idx}"
@@ -245,23 +199,13 @@ class MambaInLlamaMambaModel(nn.Module):
 
 
 # Apply @support_torch_compile decorator to backbone
-if _vllm_available and _support_torch_compile is not None:
-    MambaInLlamaMambaModel = _support_torch_compile(MambaInLlamaMambaModel)
+MambaInLlamaMambaModel = _support_torch_compile(MambaInLlamaMambaModel)
 
 
 # NATIVE vLLM MODEL CLASS
-# Dynamically create base classes with protocol inheritance
-_NativeBaseClasses = [nn.Module]
-if _HasInnerState is not None:
-    _NativeBaseClasses.append(_HasInnerState)
-if _IsHybrid is not None:
-    _NativeBaseClasses.append(_IsHybrid)
-if _SupportsMambaPrefixCaching is not None:
-    _NativeBaseClasses.append(_SupportsMambaPrefixCaching)
-_NativeBaseClasses = tuple(_NativeBaseClasses)
-
-
-class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
+class MambaInLlamaMambaForCausalLMNative(
+    nn.Module, _HasInnerState, _IsHybrid, _SupportsMambaPrefixCaching
+):
     """Native vLLM-compatible MambaInLlama model.
 
     This model supports the 'generate' runner by:
@@ -458,18 +402,8 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, bias=False)
 
         # vLLM components
-        self._vllm_logits_processor = None
-        self._vllm_sampler = None
-        if _vllm_available:
-            try:
-                self._vllm_logits_processor = LogitsProcessor(config.vocab_size)
-            except Exception:
-                pass
-        if _vllm_Sampler is not None:
-            try:
-                self._vllm_sampler = _vllm_Sampler()
-            except Exception:
-                pass
+        self._vllm_logits_processor = LogitsProcessor(config.vocab_size)
+        self._vllm_sampler = _vllm_Sampler()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Convert input token IDs to embeddings (required by VllmModelForTextGeneration)."""
@@ -759,9 +693,6 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
     @classmethod
     def get_mamba_state_shape_from_config(cls, vllm_config) -> tuple:
         """Calculate Mamba state shapes."""
-        if _vllm_MambaStateShapeCalculator is None:
-            return ((3, 4096), (4096, 16))
-
         hf_config = vllm_config.model_config.hf_config
         parallel_config = vllm_config.parallel_config
 
@@ -854,9 +785,6 @@ class MambaInLlamaMambaForCausalLMNative(*_NativeBaseClasses):
         Must match instance get_state_dtype(): SSM state defaults to float32
         when mamba_ssm_cache_dtype is "auto" to avoid bfloat16 rounding errors.
         """
-        if _vllm_MambaStateDtypeCalculator is None:
-            return (torch.bfloat16, torch.float32)
-
         hf_config = vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
         # Load mamba_config.json to detect mamba_version

@@ -23,7 +23,11 @@ Usage:
     vllm serve QwerkyAI/Qwerky-Llama3.1-Mamba-8B-Llama3.3-70B-base-distill
 """
 
-__version__ = "0.2.70"
+__version__ = "0.2.71"
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Track if we've already registered with Transformers
 _transformers_registered = False
@@ -44,9 +48,8 @@ def _register_with_transformers():
         # Register the Qwick model_type (subclass with matching model_type attribute)
         AutoConfig.register("qwerky_llama_mamba_hybrid", QwerkyLlamaMambaHybridConfig)
         _transformers_registered = True
-    except Exception:
-        # Transformers not available or already registered
-        pass
+    except Exception as e:
+        logger.warning("Failed to register config classes with Transformers AutoConfig: %s", e)
 
 
 def register():
@@ -64,38 +67,23 @@ def register():
     _register_with_transformers()
 
     # Log environment versions for debugging across machines
-    import logging
+    import vllm
+    import torch
+    import transformers
 
-    logger = logging.getLogger(__name__)
-    try:
-        import vllm
-        import torch
-        import transformers
-
-        logger.info(
-            "qwerky-vllm-models==%s, vllm==%s, torch==%s, transformers==%s",
-            __version__,
-            vllm.__version__,
-            torch.__version__,
-            transformers.__version__,
-        )
-    except ImportError:
-        logger.info(
-            "qwerky-vllm-models==%s (some dependencies not yet installed)", __version__
-        )
+    logger.info(
+        "qwerky-vllm-models==%s, vllm==%s, torch==%s, transformers==%s",
+        __version__,
+        vllm.__version__,
+        torch.__version__,
+        transformers.__version__,
+    )
 
     # Then register with vLLM
-    try:
-        from vllm import ModelRegistry
-    except ImportError:
-        # vLLM not installed - skip registration
-        return
+    from vllm import ModelRegistry
 
     # Get currently registered architectures
-    try:
-        registered = ModelRegistry.get_supported_archs()
-    except Exception:
-        registered = set()
+    registered = ModelRegistry.get_supported_archs()
 
     # Register using lazy loading (string path) to avoid CUDA issues
     # This defers the actual import until the model is needed
@@ -109,40 +97,28 @@ def register():
     # 3. Protocol inheritance (HasInnerState, IsHybrid)
 
     if "MambaInLlamaMambaForCausalLM" not in registered:
-        try:
-            ModelRegistry.register_model(
-                "MambaInLlamaMambaForCausalLM",
-                "qwerky_vllm_models.modeling:MambaInLlamaMambaForCausalLM",
-            )
-        except Exception:
-            pass
+        ModelRegistry.register_model(
+            "MambaInLlamaMambaForCausalLM",
+            "qwerky_vllm_models.modeling:MambaInLlamaMambaForCausalLM",
+        )
 
     if "MambaInLlamaMambaForCausalLMNative" not in registered:
-        try:
-            ModelRegistry.register_model(
-                "MambaInLlamaMambaForCausalLMNative",
-                "qwerky_vllm_models.modeling:MambaInLlamaMambaForCausalLMNative",
-            )
-        except Exception:
-            pass
+        ModelRegistry.register_model(
+            "MambaInLlamaMambaForCausalLMNative",
+            "qwerky_vllm_models.modeling:MambaInLlamaMambaForCausalLMNative",
+        )
 
     if "QwerkyLlamaMambaHybridForCausalLM" not in registered:
-        try:
-            ModelRegistry.register_model(
-                "QwerkyLlamaMambaHybridForCausalLM",
-                "qwerky_vllm_models.modeling:QwerkyLlamaMambaHybridForCausalLM",
-            )
-        except Exception:
-            pass
+        ModelRegistry.register_model(
+            "QwerkyLlamaMambaHybridForCausalLM",
+            "qwerky_vllm_models.modeling:QwerkyLlamaMambaHybridForCausalLM",
+        )
 
     if "QwerkyMamba2HybridForCausalLM" not in registered:
-        try:
-            ModelRegistry.register_model(
-                "QwerkyMamba2HybridForCausalLM",
-                "qwerky_vllm_models.modeling:QwerkyMamba2HybridForCausalLM",
-            )
-        except Exception:
-            pass
+        ModelRegistry.register_model(
+            "QwerkyMamba2HybridForCausalLM",
+            "qwerky_vllm_models.modeling:QwerkyMamba2HybridForCausalLM",
+        )
 
 
 # Also export the model classes for direct import if needed
