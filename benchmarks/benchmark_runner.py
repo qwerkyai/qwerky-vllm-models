@@ -34,6 +34,7 @@ from itertools import product
 from typing import Any
 import yaml
 import wandb
+import shutil
 
 log = logging.getLogger(__name__)
 logging.basicConfig(
@@ -473,6 +474,10 @@ def main() -> None:
         )
 
     log.info("All experiments completed successfully.")
+
+    # Post-experiment cleanup, remove aiperf artifacts directory
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
 
 
 if __name__ == "__main__":
