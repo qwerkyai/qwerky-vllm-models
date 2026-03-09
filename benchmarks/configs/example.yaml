@@ -1,0 +1,33 @@
+models:
+  model1:
+    name: "/home/polina/HybridMamba2_2 "
+    url: "http://localhost:8000/v1"
+    endpoint: "completions"
+  
+  model2:
+    name: "meta-llama/Llama-3.2-3B-Instruct"
+    url: "http://localhost:8001/v1"
+    endpoint: "completions"
+
+experiments:
+  experiment1:
+    request_count: [5]
+    osl: [200, 128]
+    concurrency: [1]
+    isl: [512, 1024, 2048]
+
+  experiment2:
+    request_count: [50]
+    osl: [200]
+    concurrency: [1, 10, 50]
+    isl: [1024]
+
+resume: true
+
+output_json: "benchmark_results.json"
+wandb_project: "vllm-eval2"
+wandb_entity: "qwerky-ai"
+wandb_group: "aiperf"
+wandb_name: "run1"
+wandb_job_type: "eval"
+wandb_id: "dfkywyph"
