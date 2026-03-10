@@ -1,0 +1,44 @@
+models:
+  model1:
+    name: "QwerkyAI/Qwerky-Llama3.2-Mamba2-3B-Llama3.1-8B-base-distill-false-rms"
+    url: "http://localhost:8000/v1"
+    endpoint: "completions"
+  
+  model2:
+    name: "meta-llama/Llama-3.2-3B-Instruct"
+    url: "http://localhost:8001/v1"
+    endpoint: "completions"
+
+experiments:
+  throughput_scaling:
+    request_count: [50]
+    concurrency: [1, 10, 25, 50]
+    isl: [2048]
+    osl: [200]
+
+  output_length_sweep:
+    request_count: [5]
+    concurrency: [1]
+    isl: [2048]
+    osl: [128, 200, 256, 512]
+
+  concurrency_context_matrix:
+    request_count: [50]
+    concurrency: [1, 10, 25, 50, 100]
+    isl: [512, 1024, 2048, 4096, 8192, 16384]
+    osl: [200]
+
+  long_context:
+    request_count: [5]
+    osl: [200]
+    concurrency: [1]
+    isl: [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 120000]
+
+resume: false
+
+output_json: "benchmark_results.json"
+wandb_project: "vllm-eval2"
+wandb_entity: "qwerky-ai"
+wandb_group: "aiperf"
+wandb_name: "full_benchmark"
+wandb_job_type: "eval"
