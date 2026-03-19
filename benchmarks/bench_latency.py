@@ -124,7 +124,7 @@ def bench_model(
     )
 
     # Warmup
-    sp_warmup = SamplingParams(temperature=0.0, max_tokens=16)
+    sp_warmup = SamplingParams(temperature=0.0, max_tokens=16, ignore_eos=True)
     for _ in range(WARMUP_RUNS):
         llm.generate(["Hello world"], sp_warmup)
 
@@ -134,8 +134,8 @@ def bench_model(
 
         for bs in batch_sizes:
             prompts = [prompt] * bs
-            sp_short = SamplingParams(temperature=0.0, max_tokens=SHORT_TOKENS)
-            sp_long = SamplingParams(temperature=0.0, max_tokens=LONG_TOKENS)
+            sp_short = SamplingParams(temperature=0.0, max_tokens=SHORT_TOKENS, ignore_eos=True)
+            sp_long = SamplingParams(temperature=0.0, max_tokens=LONG_TOKENS, ignore_eos=True)
 
             # Warmup this config
             try:
@@ -148,8 +148,18 @@ def bench_model(
                 results[(ctx_len, bs)] = None
                 continue
 
-            short_runs = measure(llm, prompts, sp_short, BENCH_RUNS)
-            long_runs = measure(llm, prompts, sp_long, BENCH_RUNS)
+            try:
+                short_runs = measure(llm, prompts, sp_short, BENCH_RUNS)
+                long_runs = measure(llm, prompts, sp_long, BENCH_RUNS)
+            except Exception as e:
+                log.warning(
+                    "ctx=%6d, batch=%2d: FAILED during bench (%s)",
+                    ctx_len,
+                    bs,
+                    e.__class__.__name__,
+                )
+                results[(ctx_len, bs)] = None
+                continue
 
             input_toks = short_runs[0]["in_toks"]
             short_toks = short_runs[0]["per_req_out_toks"]
@@ -323,6 +333,9 @@ if __name__ == "__main__":
         "--batch-sizes", type=int, nargs="+", default=[1], help="Batch sizes to test"
     )
     args = parser.parse_args()
+
+    if args.qwerky_only and args.llama_only:
+        parser.error("--qwerky-only and --llama-only are mutually exclusive")
 
     qwerky_path = resolve_model_path(args.qwerky)
     llama_path = resolve_model_path(args.llama)
