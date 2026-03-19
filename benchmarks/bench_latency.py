@@ -8,22 +8,22 @@ For each model × context length × mode, measures:
 
 Usage:
     # Compare default Qwerky vs Llama
-    python bench_decode_vs_prefill.py
+    python bench_latency.py
 
     # Custom model paths
-    python bench_decode_vs_prefill.py --qwerky /path/to/model --llama /path/to/model
+    python bench_latency.py --qwerky /path/to/model --llama /path/to/model
 
     # HuggingFace model names (downloaded automatically)
-    python bench_decode_vs_prefill.py --qwerky QwerkyAI/Qwerky-Mamba2-3B --llama meta-llama/Llama-3.2-3B-Instruct
+    python bench_latency.py --qwerky QwerkyAI/Qwerky-Mamba2-3B --llama meta-llama/Llama-3.2-3B-Instruct
 
     # Single model only
-    python bench_decode_vs_prefill.py --qwerky-only
-    python bench_decode_vs_prefill.py --llama-only
+    python bench_latency.py --qwerky-only
+    python bench_latency.py --llama-only
 
     # Options
-    python bench_decode_vs_prefill.py --eager
-    python bench_decode_vs_prefill.py --contexts 512 4096 16384
-    python bench_decode_vs_prefill.py --batch-sizes 1 4 8
+    python bench_latency.py --eager
+    python bench_latency.py --contexts 512 4096 16384
+    python bench_latency.py --batch-sizes 1 4 8
 """
 
 import argparse
@@ -235,19 +235,19 @@ def print_comparison(
         log.info("  %s", "-" * len(header.strip()))
 
         for ctx in context_lengths:
-            q = qwerky.get((ctx, bs))
-            l = llama.get((ctx, bs))
-            if not q or not l:
+            q_res = qwerky.get((ctx, bs))
+            l_res = llama.get((ctx, bs))
+            if not q_res or not l_res:
                 continue
-            d_ratio = q["decode_tok_s"] / l["decode_tok_s"]
+            d_ratio = q_res["decode_tok_s"] / l_res["decode_tok_s"]
             t_ratio = (
-                q["ttft_proxy_ms"] / l["ttft_proxy_ms"]
-                if l["ttft_proxy_ms"] > 0
+                q_res["ttft_proxy_ms"] / l_res["ttft_proxy_ms"]
+                if l_res["ttft_proxy_ms"] > 0
                 else float("inf")
             )
             p_ratio = (
-                q["prefill_ms"] / l["prefill_ms"]
-                if l["prefill_ms"] > 0
+                q_res["prefill_ms"] / l_res["prefill_ms"]
+                if l_res["prefill_ms"] > 0
                 else float("inf")
             )
             d_marker = "*" if d_ratio > 1.0 else " "
@@ -256,15 +256,15 @@ def print_comparison(
                 " | %6.1f ms | %6.1f ms | %5.1fx"
                 " | %7.1f ms | %7.1f ms | %5.1fx",
                 ctx,
-                q["decode_ms"],
-                l["decode_ms"],
+                q_res["decode_ms"],
+                l_res["decode_ms"],
                 d_ratio,
                 d_marker,
-                q["ttft_proxy_ms"],
-                l["ttft_proxy_ms"],
+                q_res["ttft_proxy_ms"],
+                l_res["ttft_proxy_ms"],
                 t_ratio,
-                q["prefill_ms"],
-                l["prefill_ms"],
+                q_res["prefill_ms"],
+                l_res["prefill_ms"],
                 p_ratio,
             )
 
