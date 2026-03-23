@@ -17,6 +17,7 @@ experiments:
     isl: [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 120000]
 
 resume: false
+table_metrics: ["time_to_first_token", "output_token_throughput", "request_latency"]
 
 output_json: "benchmark_results.json"
 wandb_project: "vllm-eval2"

@@ -62,6 +62,8 @@ METRIC_ORDER = [
     ("request_count", "Request Count (requests)"),
 ]
 
+METRIC_DISPLAY_MAP = {key: display for key, display in METRIC_ORDER}
+
 
 def sanitize_metric_name(name: str) -> str:
     # Convert display name to a lowercase snake_case key without parentheses
@@ -243,6 +245,13 @@ def log_tables_for_variable_param(
         "osl": "o",
     }
 
+    table_metrics: list[str] = cfg.get("table_metrics", ["output_token_throughput"])
+
+    valid_metrics = {k for k, _ in METRIC_ORDER}
+    for m in table_metrics:
+        if m not in valid_metrics:
+            raise ValueError(f"Invalid table metric: {m}")
+
     for exp_name, exp_cfg in cfg["experiments"].items():
         models_sorted: list[str] = sorted(cfg["models"].keys())
         model_names: list[str] = [cfg["models"][m]["name"] for m in models_sorted]
@@ -269,40 +278,6 @@ def log_tables_for_variable_param(
             for combo in product(*other_values):
                 fixed_values: dict[str, Any] = dict(zip(other_params, combo))
 
-                table = wandb.Table(columns=[row_param] + model_names)
-
-                for val in row_values:
-                    row: list[Any] = [val]
-
-                    for m in models_sorted:
-                        model_name: str = cfg["models"][m]["name"]
-                        found: Any = None
-
-                        if model_name in results and exp_name in results[model_name]:
-                            for run in results[model_name][exp_name]:
-                                params: dict[str, Any] = run["params"]
-
-                                # Check that all fixed params match this run
-                                match: bool = True
-                                for p in fixed_values:
-                                    if params[p] != fixed_values[p]:
-                                        match = False
-                                        break
-
-                                if match and params[row_param] == val:
-                                    for r in run["summary"]:
-                                        if (
-                                            r["Metric"]
-                                            == "Output Token Throughput (tokens/sec)"
-                                        ):
-                                            found = r["avg"]
-                                            break
-
-                        row.append(found)
-
-                    table.add_data(*row)
-
-                # Build a descriptive name like "exp_rN_c10_i512_o128"
                 name_parts: list[str] = []
 
                 for p in ["request_count", "concurrency", "isl", "osl"]:
@@ -313,9 +288,44 @@ def log_tables_for_variable_param(
                         if val is not None:
                             name_parts.append(prefix[p] + str(val))
 
-                table_name: str = f"{exp_name}_" + "_".join(name_parts)
+                for metric_key in table_metrics:
+                    metric_display = METRIC_DISPLAY_MAP.get(metric_key)
 
-                wandb.log({table_name: table})
+                    table = wandb.Table(columns=[row_param] + model_names)
+
+                    for val in row_values:
+                        row: list[Any] = [val]
+
+                        for m in models_sorted:
+                            model_name: str = cfg["models"][m]["name"]
+                            found: Any = None
+
+                            if (
+                                model_name in results
+                                and exp_name in results[model_name]
+                            ):
+                                for run in results[model_name][exp_name]:
+                                    params: dict[str, Any] = run["params"]
+
+                                    match: bool = True
+                                    for p in fixed_values:
+                                        if params[p] != fixed_values[p]:
+                                            match = False
+                                            break
+
+                                    if match and params[row_param] == val:
+                                        for r in run["summary"]:
+                                            if r["Metric"] == metric_display:
+                                                found = r["avg"]
+                                                break
+
+                            row.append(found)
+
+                        table.add_data(*row)
+
+                    table_name: str = f"{exp_name}_{metric_key}_" + "_".join(name_parts)
+
+                    wandb.log({table_name: table})
 
 
 def run_experiments(
